@@ -6,170 +6,303 @@ import { useEffect, useRef, useState } from "react";
 // backend URL, e.g. https://slc-merger-backend-production.up.railway.app
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-type JobStatus = "idle" | "uploading" | "pending" | "processing" | "done" | "failed";
+type JobStatus = "queued" | "processing" | "done" | "failed";
+
+interface Job {
+  job_id: string;
+  status: JobStatus;
+  progress: string[];
+  error: string | null;
+  result_filename: string | null;
+  original_filename: string;
+  course_name: string;
+  unit_number: string;
+  created_at: number;
+}
+
+interface StagedItem {
+  key: string;
+  file: File;
+  courseName: string;
+  unitNumber: string;
+}
 
 export default function Home() {
   const [courseName, setCourseName] = useState("");
-  const [unitNumber, setUnitNumber] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [status, setStatus] = useState<JobStatus>("idle");
-  const [progress, setProgress] = useState<string[]>([]);
+  const [staged, setStaged] = useState<StagedItem[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [resultFilename, setResultFilename] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Poll the shared queue continuously — this is a team queue, not a
+  // per-session one, so everyone sees the same list and it survives reloads.
   useEffect(() => {
+    fetchJobs();
+    pollRef.current = setInterval(fetchJobs, 2000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, []);
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setResultFilename(null);
-    setProgress([]);
-
-    if (!file) {
-      setError("Choose a video file first.");
-      return;
-    }
-    if (!courseName.trim() || !unitNumber.trim()) {
-      setError("Course name and unit number are required.");
-      return;
-    }
-
-    const form = new FormData();
-    form.append("course_name", courseName);
-    form.append("unit_number", unitNumber);
-    form.append("video", file);
-
-    setStatus("uploading");
+  async function fetchJobs() {
     try {
-      const res = await fetch(`${API_URL}/jobs`, { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.text();
-        throw new Error(detail || `Upload failed (${res.status})`);
-      }
+      const res = await fetch(`${API_URL}/jobs`);
+      if (!res.ok) return;
       const data = await res.json();
-      setJobId(data.job_id);
-      setStatus("pending");
-      startPolling(data.job_id);
-    } catch (err: any) {
-      setStatus("failed");
-      setError(err.message || "Upload failed.");
+      setJobs(data.jobs || []);
+    } catch {
+      // transient network hiccup — next tick retries
     }
   }
 
-  function startPolling(id: string) {
-    if (pollRef.current) clearInterval(pollRef.current);
-    pollRef.current = setInterval(async () => {
-      try {
-        const res = await fetch(`${API_URL}/jobs/${id}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        setStatus(data.status);
-        setProgress(data.progress || []);
-        if (data.status === "done") {
-          setResultFilename(data.result_filename);
-          if (pollRef.current) clearInterval(pollRef.current);
-        } else if (data.status === "failed") {
-          setError(data.error || "Processing failed.");
-          if (pollRef.current) clearInterval(pollRef.current);
-        }
-      } catch {
-        // transient network hiccup — next tick will retry
-      }
-    }, 2000);
+  function handleFilesPicked(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    const startUnit = staged.length + 1;
+    const additions: StagedItem[] = Array.from(files).map((file, i) => ({
+      key: `${file.name}-${file.size}-${Date.now()}-${i}`,
+      file,
+      courseName,
+      unitNumber: `Unit ${startUnit + i}`,
+    }));
+    setStaged((prev) => [...prev, ...additions]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
-  const busy = status === "uploading" || status === "pending" || status === "processing";
+  function updateStaged(key: string, patch: Partial<StagedItem>) {
+    setStaged((prev) => prev.map((s) => (s.key === key ? { ...s, ...patch } : s)));
+  }
+
+  function removeStaged(key: string) {
+    setStaged((prev) => prev.filter((s) => s.key !== key));
+  }
+
+  async function submitQueue() {
+    setError(null);
+    if (staged.length === 0) return;
+    for (const item of staged) {
+      if (!item.courseName.trim() || !item.unitNumber.trim()) {
+        setError("Every queued video needs a course name and unit number.");
+        return;
+      }
+    }
+
+    setSubmitting(true);
+    try {
+      // Fire uploads sequentially — the backend queues processing anyway,
+      // but sequential uploads avoid saturating upload bandwidth on large
+      // files all at once.
+      for (const item of staged) {
+        const form = new FormData();
+        form.append("course_name", item.courseName);
+        form.append("unit_number", item.unitNumber);
+        form.append("video", item.file);
+        const res = await fetch(`${API_URL}/jobs`, { method: "POST", body: form });
+        if (!res.ok) {
+          const detail = await res.text();
+          throw new Error(`${item.file.name}: ${detail || res.status}`);
+        }
+      }
+      setStaged([]);
+      fetchJobs();
+    } catch (err: any) {
+      setError(err.message || "Failed to queue one or more videos.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const activeCount = jobs.filter((j) => j.status === "queued" || j.status === "processing").length;
 
   return (
-    <main style={{ maxWidth: 640, margin: "0 auto", padding: "48px 24px" }}>
+    <main style={{ maxWidth: 760, margin: "0 auto", padding: "48px 24px" }}>
       <h1 style={{ fontSize: 28, marginBottom: 4 }}>🎬 SLC Video Merger</h1>
       <p style={{ color: "#9fc4d4", marginTop: 0, marginBottom: 32 }}>
-        Upload a NotebookLM export — we&apos;ll add the intro/outro, strip the
-        watermark, and hand back a branded MP4.
+        Queue up several NotebookLM exports at once — they process one at a
+        time in the background so nothing slows down from contention.
       </p>
 
-      <form onSubmit={handleSubmit} style={{ display: "grid", gap: 16 }}>
+      <section style={{ marginBottom: 32 }}>
         <label style={fieldLabel}>
-          Course name
+          Course name (applied to new videos you add below)
           <input
             style={inputStyle}
             value={courseName}
             onChange={(e) => setCourseName(e.target.value)}
-            disabled={busy}
             placeholder="e.g. Intro to Biology"
           />
         </label>
 
-        <label style={fieldLabel}>
-          Unit number
+        <div style={{ marginTop: 16 }}>
           <input
-            style={inputStyle}
-            value={unitNumber}
-            onChange={(e) => setUnitNumber(e.target.value)}
-            disabled={busy}
-            placeholder="e.g. Unit 3"
-          />
-        </label>
-
-        <label style={fieldLabel}>
-          Video file
-          <input
+            ref={fileInputRef}
             type="file"
+            multiple
             accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/x-msvideo"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
-            disabled={busy}
-            style={{ marginTop: 6 }}
+            onChange={(e) => handleFilesPicked(e.target.files)}
           />
-        </label>
-
-        <button type="submit" disabled={busy} style={buttonStyle(busy)}>
-          {busy ? "Working…" : "Upload & Merge"}
-        </button>
-      </form>
-
-      {error && (
-        <p style={{ color: "#ff8a8a", marginTop: 20 }}>⚠️ {error}</p>
-      )}
-
-      {jobId && status !== "idle" && (
-        <div style={{ marginTop: 32 }}>
-          <h3 style={{ marginBottom: 8 }}>Status: {status}</h3>
-          <div
-            style={{
-              background: "#0d3b54",
-              borderRadius: 8,
-              padding: 12,
-              maxHeight: 220,
-              overflowY: "auto",
-              fontFamily: "monospace",
-              fontSize: 13,
-              lineHeight: 1.6,
-            }}
-          >
-            {progress.length === 0 && <div style={{ opacity: 0.6 }}>Waiting for the job to start…</div>}
-            {progress.map((line, i) => (
-              <div key={i}>{line}</div>
-            ))}
-          </div>
-
-          {status === "done" && resultFilename && (
-            <a
-              href={`${API_URL}/jobs/${jobId}/file`}
-              style={{ ...buttonStyle(false), display: "inline-block", marginTop: 16, textDecoration: "none" }}
-            >
-              ⬇ Download {resultFilename}
-            </a>
-          )}
         </div>
-      )}
+
+        {staged.length > 0 && (
+          <div style={{ marginTop: 20, display: "grid", gap: 10 }}>
+            {staged.map((item) => (
+              <div
+                key={item.key}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 140px 32px",
+                  gap: 8,
+                  alignItems: "center",
+                  background: "#0d3b54",
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                }}
+              >
+                <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  📄 {item.file.name}
+                </div>
+                <input
+                  style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
+                  value={item.unitNumber}
+                  onChange={(e) => updateStaged(item.key, { unitNumber: e.target.value })}
+                  placeholder="Unit number"
+                />
+                <button
+                  onClick={() => removeStaged(item.key)}
+                  title="Remove"
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "#ff8a8a",
+                    cursor: "pointer",
+                    fontSize: 16,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+
+            <button
+              onClick={submitQueue}
+              disabled={submitting}
+              style={{ ...buttonStyle(submitting), marginTop: 8, justifySelf: "start" }}
+            >
+              {submitting
+                ? "Queuing…"
+                : `Add ${staged.length} video${staged.length > 1 ? "s" : ""} to queue`}
+            </button>
+          </div>
+        )}
+
+        {error && <p style={{ color: "#ff8a8a", marginTop: 12 }}>⚠️ {error}</p>}
+      </section>
+
+      <section>
+        <h2 style={{ fontSize: 18, marginBottom: 12 }}>
+          Queue {activeCount > 0 && <span style={{ color: "#60ccbe" }}>({activeCount} active)</span>}
+        </h2>
+
+        {jobs.length === 0 && (
+          <p style={{ color: "#6f97a6" }}>Nothing queued yet — add a video above.</p>
+        )}
+
+        <div style={{ display: "grid", gap: 12 }}>
+          {jobs.map((job) => (
+            <JobCard key={job.job_id} job={job} />
+          ))}
+        </div>
+      </section>
     </main>
   );
+}
+
+function JobCard({ job }: { job: Job }) {
+  const [expanded, setExpanded] = useState(false);
+  const badge = statusBadge(job.status);
+
+  return (
+    <div style={{ background: "#0d3b54", borderRadius: 10, padding: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 600, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {job.course_name} — {job.unit_number}
+          </div>
+          <div style={{ fontSize: 12, color: "#7fa9b8" }}>{job.original_filename}</div>
+        </div>
+        <span
+          style={{
+            ...badge,
+            padding: "4px 10px",
+            borderRadius: 999,
+            fontSize: 12,
+            fontWeight: 600,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {job.status}
+        </span>
+      </div>
+
+      {job.status === "processing" && job.progress.length > 0 && (
+        <div style={{ fontSize: 12, color: "#9fc4d4", marginTop: 8 }}>
+          {job.progress[job.progress.length - 1]}
+        </div>
+      )}
+
+      {job.error && <div style={{ color: "#ff8a8a", fontSize: 13, marginTop: 8 }}>⚠️ {job.error}</div>}
+
+      {job.progress.length > 0 && (
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          style={{ background: "none", border: "none", color: "#60ccbe", fontSize: 12, cursor: "pointer", padding: 0, marginTop: 8 }}
+        >
+          {expanded ? "Hide log" : "Show log"}
+        </button>
+      )}
+      {expanded && (
+        <div
+          style={{
+            marginTop: 8,
+            background: "#062a30",
+            borderRadius: 6,
+            padding: 10,
+            fontFamily: "monospace",
+            fontSize: 12,
+            maxHeight: 160,
+            overflowY: "auto",
+          }}
+        >
+          {job.progress.map((line, i) => (
+            <div key={i}>{line}</div>
+          ))}
+        </div>
+      )}
+
+      {job.status === "done" && job.result_filename && (
+        <a
+          href={`${API_URL}/jobs/${job.job_id}/file`}
+          style={{ ...buttonStyle(false), display: "inline-block", marginTop: 12, textDecoration: "none", padding: "8px 16px", fontSize: 13 }}
+        >
+          ⬇ Download
+        </a>
+      )}
+    </div>
+  );
+}
+
+function statusBadge(status: JobStatus): React.CSSProperties {
+  switch (status) {
+    case "queued":
+      return { background: "#3a4a56", color: "#cfe8f0" };
+    case "processing":
+      return { background: "#2a5a6e", color: "#8fe8d8" };
+    case "done":
+      return { background: "#1f5c3a", color: "#8fe8b0" };
+    case "failed":
+      return { background: "#5c2323", color: "#ff8a8a" };
+  }
 }
 
 const fieldLabel: React.CSSProperties = {
@@ -184,7 +317,7 @@ const inputStyle: React.CSSProperties = {
   padding: "10px 12px",
   borderRadius: 8,
   border: "1px solid #1c5670",
-  background: "#0d3b54",
+  background: "#08303f",
   color: "#fff",
   fontSize: 15,
 };

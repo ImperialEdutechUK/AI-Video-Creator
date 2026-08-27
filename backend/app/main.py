@@ -3,21 +3,30 @@
 FastAPI wrapper around pipeline.py.
 
 Endpoints:
-  POST /jobs             upload a video + course/unit -> starts a background job, returns job id
-  GET  /jobs/{id}        poll status: pending | processing | done | failed  (+ progress log)
-  GET  /jobs/{id}/file   download the finished mp4
-  GET  /healthz          liveness check for Railway
+  POST /jobs             upload a video + course/unit -> enqueues a job, returns job id
+  GET  /jobs              list all jobs (newest first) — powers the frontend's queue view
+  GET  /jobs/{id}         poll one job's status/progress
+  GET  /jobs/{id}/file    download the finished mp4
+  GET  /healthz           liveness check for Railway
+
+Jobs run through a small bounded worker pool instead of one thread per
+upload. This matters for both correctness of the "queue" (jobs beyond the
+worker count sit in status="queued" until a worker frees up) and for speed:
+video encoding is CPU-bound, so running more jobs at once than you have
+CPU cores just makes every one of them slower via contention. Tune with
+the WORKERS env var to match your Railway plan's CPU allocation.
 
 Jobs are kept in memory. That's fine for a single-instance minimal deploy;
 if you scale to multiple Railway instances later, swap JOBS for Redis/DB.
 """
 import os
+import queue
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,41 +52,44 @@ app.add_middleware(
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 
-# job_id -> {status, progress: [str], error, result_path, result_filename}
+# How many videos process at once. Video encoding is CPU-bound, so this
+# should roughly match the number of CPU cores your Railway plan gives you
+# — set higher than that and jobs slow each other down instead of speeding
+# up. Default 1 is the safe choice for Railway's smaller plans.
+WORKERS = max(1, int(os.environ.get("WORKERS", "1")))
+
+# job_id -> {status, progress, error, result_path, result_filename,
+#            course_name, unit_number, original_filename, created_at}
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
+JOB_QUEUE: "queue.Queue[str]" = queue.Queue()
 
-# Where finished files + temp workdirs live. Railway gives you an ephemeral
-# filesystem, which is fine here since files are only needed until the user
-# downloads them.
 WORK_ROOT = Path(tempfile.gettempdir()) / "slc-merger-jobs"
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-@app.on_event("startup")
-def _startup():
-    pipeline.ensure_assets()
+def _worker_loop():
+    while True:
+        job_id = JOB_QUEUE.get()
+        try:
+            _run_job(job_id)
+        finally:
+            JOB_QUEUE.task_done()
 
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-
-def _run_job(job_id: str, course_name: str, unit_number: str, video_bytes: bytes):
-    job_dir = WORK_ROOT / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+def _run_job(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS[job_id]
+        job["status"] = "processing"
+        course_name, unit_number, video_bytes = (
+            job["course_name"], job["unit_number"], job.pop("_video_bytes"),
+        )
 
     def progress_cb(msg: str):
         with JOBS_LOCK:
             JOBS[job_id]["progress"].append(msg)
 
-    with JOBS_LOCK:
-        JOBS[job_id]["status"] = "processing"
-
-    # process_video writes raw upload + every intermediate ffmpeg output
-    # (norm.mp4, intro.mp4, etc.) directly into the dir it's given. Use a
-    # scratch subfolder so we can wipe everything except the final file.
+    job_dir = WORK_ROOT / job_id
     scratch = job_dir / "scratch"
     scratch.mkdir(parents=True, exist_ok=True)
 
@@ -96,10 +108,21 @@ def _run_job(job_id: str, course_name: str, unit_number: str, video_bytes: bytes
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = pipeline._sanitise_error(e)
     finally:
-        # Drop the raw upload + every intermediate ffmpeg file; only the
-        # final mp4 (already copied to job_dir above) needs to stick around
-        # for the download endpoint.
+        # Only the final mp4 (already copied to job_dir above) needs to
+        # stick around for the download endpoint.
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+@app.on_event("startup")
+def _startup():
+    pipeline.ensure_assets()
+    for _ in range(WORKERS):
+        threading.Thread(target=_worker_loop, daemon=True).start()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "workers": WORKERS, "queue_depth": JOB_QUEUE.qsize()}
 
 
 @app.post("/jobs")
@@ -119,19 +142,42 @@ async def create_job(
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {
-            "status": "pending",
+            "status": "queued",
             "progress": [],
             "error": None,
             "result_path": None,
             "result_filename": None,
+            "course_name": course_name,
+            "unit_number": unit_number,
+            "original_filename": video.filename,
+            "created_at": time.time(),
+            "_video_bytes": video_bytes,
         }
 
-    thread = threading.Thread(
-        target=_run_job, args=(job_id, course_name, unit_number, video_bytes), daemon=True
-    )
-    thread.start()
-
+    JOB_QUEUE.put(job_id)
     return {"job_id": job_id}
+
+
+def _public_job(job_id: str, job: dict) -> dict:
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job["progress"][-20:],  # last 20 lines is plenty for a UI
+        "error": job["error"],
+        "result_filename": job["result_filename"],
+        "original_filename": job["original_filename"],
+        "course_name": job["course_name"],
+        "unit_number": job["unit_number"],
+        "created_at": job["created_at"],
+    }
+
+
+@app.get("/jobs")
+def list_jobs():
+    with JOBS_LOCK:
+        jobs = [_public_job(jid, j) for jid, j in JOBS.items()]
+    jobs.sort(key=lambda j: j["created_at"], reverse=True)
+    return {"jobs": jobs}
 
 
 @app.get("/jobs/{job_id}")
@@ -140,13 +186,7 @@ def get_job(job_id: str):
         job = JOBS.get(job_id)
         if not job:
             raise HTTPException(404, "Job not found")
-        return {
-            "job_id": job_id,
-            "status": job["status"],
-            "progress": job["progress"][-20:],  # last 20 lines is plenty for a UI
-            "error": job["error"],
-            "result_filename": job["result_filename"],
-        }
+        return _public_job(job_id, job)
 
 
 @app.get("/jobs/{job_id}/file")

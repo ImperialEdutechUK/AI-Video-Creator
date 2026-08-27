@@ -7,9 +7,20 @@ only the interface changed from a Streamlit UI to HTTP job endpoints.
 
 ## Endpoints
 - `POST /jobs` — multipart form (`course_name`, `unit_number`, `video`) → `{job_id}`
+- `GET /jobs` — lists every job (newest first) — powers the frontend's shared queue view
 - `GET /jobs/{id}` — `{status, progress[], error, result_filename}`
 - `GET /jobs/{id}/file` — downloads the finished MP4 once `status == "done"`
-- `GET /healthz` — liveness check
+- `GET /healthz` — liveness check, also reports `workers` and `queue_depth`
+
+## Job queue
+
+Jobs run through a small bounded worker pool (`WORKERS` env var, default 1)
+instead of one thread per upload. Submit as many videos as you want — extra
+ones sit with `status: "queued"` until a worker frees up, rather than all
+starting immediately and competing for the same CPU. That contention is
+usually what makes concurrent video processing *slower*, not faster, so the
+queue is also the fix for "make it faster" as much as it is for "let me
+queue more videos."
 
 ## Deploy to Railway
 
@@ -23,6 +34,11 @@ only the interface changed from a Streamlit UI to HTTP job endpoints.
    - `FRONTEND_ORIGIN` = your Vercel URL, e.g. `https://your-app.vercel.app`
      (comma-separate multiple origins if needed; defaults to `*` if unset)
    - `MAX_UPLOAD_MB` = `500` (optional, matches the original app's cap)
+   - `WORKERS` = how many videos process at once (default `1`). Video
+     encoding is CPU-bound, so this should match the number of CPU cores
+     your Railway plan actually gives you — setting it higher than that
+     makes concurrent jobs slower via contention, not faster. Check your
+     plan's vCPU count before raising this above 1.
 5. Railway auto-assigns a public URL like
    `https://your-service-production.up.railway.app`. Copy it — the frontend
    needs it as `NEXT_PUBLIC_API_URL`.
@@ -42,7 +58,15 @@ only the interface changed from a Streamlit UI to HTTP job endpoints.
   lost on redeploy/restart, and this won't scale past a single Railway
   instance. Fine for personal/small-team use; swap `JOBS` in `main.py` for
   Redis or a database if you need more durability or horizontal scaling.
+- **Queue is shared, not per-user** — `GET /jobs` returns every job on the
+  server, not scoped to whoever's asking. Fine for a small trusted team,
+  not fine if you expose this publicly without adding auth/scoping first.
 - **Large uploads** — Railway doesn't impose Vercel-style request timeouts,
   but very long videos will still take real wall-clock time to process
   (ffmpeg re-encoding isn't instant). The frontend polls every 2s so the
   user sees live progress either way.
+- **Speed** — the pipeline already uses `libx264 -preset ultrafast` and
+  skips re-encoding in `concat` wherever it safely can, so there wasn't
+  free encode-speed left on the table. The `WORKERS` env var (see above)
+  is the main lever now: raising it only helps if your Railway plan
+  actually has spare CPU cores to give it.
