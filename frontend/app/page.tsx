@@ -166,7 +166,7 @@ export default function Home() {
                   style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
                   value={item.unitNumber}
                   onChange={(e) => updateStaged(item.key, { unitNumber: e.target.value })}
-                  placeholder="Unit number"
+                  placeholder="e.g. UNIT 03 | CHAPTER 06"
                 />
                 <button
                   onClick={() => removeStaged(item.key)}
