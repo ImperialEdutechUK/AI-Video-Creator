@@ -32,7 +32,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from . import pipeline
+from . import drive, pipeline
 
 app = FastAPI(title="SLC Video Merger API")
 
@@ -59,7 +59,8 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 WORKERS = max(1, int(os.environ.get("WORKERS", "1")))
 
 # job_id -> {status, progress, error, result_path, result_filename,
-#            course_name, unit_number, original_filename, created_at}
+#            course_name, unit_number, chapter_number, original_filename,
+#            created_at, drive_status, drive_error, drive_link}
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 JOB_QUEUE: "queue.Queue[str]" = queue.Queue()
@@ -129,6 +130,7 @@ def healthz():
 async def create_job(
     course_name: str = Form(...),
     unit_number: str = Form(...),
+    chapter_number: str = Form(""),
     video: UploadFile = File(...),
 ):
     if not video.filename:
@@ -149,9 +151,16 @@ async def create_job(
             "result_filename": None,
             "course_name": course_name,
             "unit_number": unit_number,
+            "chapter_number": chapter_number,
             "original_filename": video.filename,
             "created_at": time.time(),
             "_video_bytes": video_bytes,
+            # Google Drive save state — separate from the processing
+            # status above, since saving to Drive is a second, optional,
+            # user-triggered step that only makes sense once done.
+            "drive_status": "idle",   # idle | saving | saved | failed
+            "drive_error": None,
+            "drive_link": None,
         }
 
     JOB_QUEUE.put(job_id)
@@ -168,7 +177,11 @@ def _public_job(job_id: str, job: dict) -> dict:
         "original_filename": job["original_filename"],
         "course_name": job["course_name"],
         "unit_number": job["unit_number"],
+        "chapter_number": job.get("chapter_number", ""),
         "created_at": job["created_at"],
+        "drive_status": job.get("drive_status", "idle"),
+        "drive_error": job.get("drive_error"),
+        "drive_link": job.get("drive_link"),
     }
 
 
@@ -201,3 +214,47 @@ def get_job_file(job_id: str):
         filename = job["result_filename"]
 
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
+def _run_drive_save(job_id: str):
+    """Uploads a finished video to Drive in the background. Runs in its
+    own thread (started by the endpoint below) so the one-click button
+    returns immediately and the frontend polls /jobs/{id} for progress,
+    the same way it already polls for processing status."""
+    with JOBS_LOCK:
+        job = JOBS[job_id]
+        course_name = job["course_name"]
+        unit_number = job["unit_number"]
+        chapter_number = job.get("chapter_number", "")
+        result_path = job["result_path"]
+
+    try:
+        result = drive.upload_video(course_name, unit_number, chapter_number, result_path)
+        with JOBS_LOCK:
+            JOBS[job_id]["drive_status"] = "saved"
+            JOBS[job_id]["drive_link"] = result["web_view_link"]
+            JOBS[job_id]["drive_error"] = None
+    except Exception as e:
+        with JOBS_LOCK:
+            JOBS[job_id]["drive_status"] = "failed"
+            JOBS[job_id]["drive_error"] = pipeline._sanitise_error(e)
+
+
+@app.post("/jobs/{job_id}/drive")
+def save_to_drive(job_id: str):
+    """One-click 'Save to Google Drive'. Uploads the finished video into
+    <root folder>/<course name>/, creating the course folder the first
+    time and reusing it for every later unit/chapter in that course."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        if job["status"] != "done" or not job["result_path"]:
+            raise HTTPException(409, f"Job is not finished (status: {job['status']})")
+        if job.get("drive_status") == "saving":
+            raise HTTPException(409, "Already saving to Drive")
+        job["drive_status"] = "saving"
+        job["drive_error"] = None
+
+    threading.Thread(target=_run_drive_save, args=(job_id,), daemon=True).start()
+    return {"drive_status": "saving"}

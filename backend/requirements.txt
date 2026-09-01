@@ -5,3 +5,5 @@ Pillow>=10.0
 numpy
 opencv-python-headless>=4.8
 pytesseract
+google-api-python-client>=2.130
+google-auth>=2.30

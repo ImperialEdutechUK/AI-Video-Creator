@@ -6,11 +6,49 @@ Streamlit app's core functions — the processing logic itself is unchanged;
 only the interface changed from a Streamlit UI to HTTP job endpoints.
 
 ## Endpoints
-- `POST /jobs` — multipart form (`course_name`, `unit_number`, `video`) → `{job_id}`
+- `POST /jobs` — multipart form (`course_name`, `unit_number`, `chapter_number`, `video`) → `{job_id}`. `chapter_number` is optional.
 - `GET /jobs` — lists every job (newest first) — powers the frontend's shared queue view
-- `GET /jobs/{id}` — `{status, progress[], error, result_filename}`
+- `GET /jobs/{id}` — `{status, progress[], error, result_filename, drive_status, drive_link, drive_error}`
 - `GET /jobs/{id}/file` — downloads the finished MP4 once `status == "done"`
+- `POST /jobs/{id}/drive` — one-click "Save to Google Drive". Only works once the job's `status == "done"`. Runs in the background; poll `GET /jobs/{id}` for `drive_status` (`idle` → `saving` → `saved`/`failed`).
 - `GET /healthz` — liveness check, also reports `workers` and `queue_depth`
+
+## Save to Google Drive
+
+Videos are saved with this layout, using a Google Cloud **service account**
+so the whole flow is one click — no per-user Google sign-in:
+
+```
+<your Drive root folder>/
+  <Course Name>/                                   (created once, reused after)
+    <Course Name> - <Unit Number> - <Chapter Number>.mp4
+    <Course Name> - <Unit Number> - <Chapter Number>.mp4
+  <Another Course>/
+    ...
+```
+
+If a course folder already exists it's reused, so every unit/chapter for
+that course lands in the same place instead of creating duplicates.
+
+**One-time setup:**
+1. In [Google Cloud Console](https://console.cloud.google.com/), create (or
+   reuse) a project and enable the **Google Drive API**.
+2. Create a **Service Account** (IAM & Admin → Service Accounts), then
+   create a JSON key for it and download it.
+3. Open your target Drive folder — e.g.
+   `https://drive.google.com/drive/folders/1cY7v7956TyrJbGPGno4QQJ5Zpj6bXDjZ`
+   — and **Share** it with the service account's email address (looks like
+   `something@your-project.iam.gserviceaccount.com`), giving it **Editor**
+   access. This step is required — a service account can only see/write to
+   folders explicitly shared with it.
+4. On Railway, add these variables to the backend service:
+   - `GOOGLE_SERVICE_ACCOUNT_JSON` — paste the **entire contents** of the
+     downloaded key JSON file as a single-line value.
+   - `GOOGLE_DRIVE_ROOT_FOLDER_ID` — the folder ID from the URL in step 3
+     (defaults to `1cY7v7956TyrJbGPGno4QQJ5Zpj6bXDjZ`, i.e. the folder you
+     shared, so you only need to set this if you want a different root).
+5. Redeploy. The "Save to Google Drive" button on each finished job will
+   now work.
 
 ## Job queue
 
@@ -46,10 +84,9 @@ queue more videos."
    should return `{"ok": true}`.
 
 ## Notes / limitations of this minimal build
-- **No Google Drive upload and no Canva integration yet** — those were in
-  the original Streamlit app but are out of scope for this first pass.
-  They can be added back as additional endpoints once the core flow is
-  confirmed working end-to-end.
+- **No Canva integration yet** — that was in the original Streamlit app
+  but is out of scope for this pass. Google Drive save is now built in
+  (see above).
 - **No password gate** — the original app's optional `APP_PASSWORD` check
   isn't ported yet. Add auth (e.g. an API key header checked in `main.py`,
   or Railway's private networking) before exposing this publicly with

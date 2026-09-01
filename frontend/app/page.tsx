@@ -8,6 +8,8 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 type JobStatus = "queued" | "processing" | "done" | "failed";
 
+type DriveStatus = "idle" | "saving" | "saved" | "failed";
+
 interface Job {
   job_id: string;
   status: JobStatus;
@@ -17,7 +19,11 @@ interface Job {
   original_filename: string;
   course_name: string;
   unit_number: string;
+  chapter_number: string;
   created_at: number;
+  drive_status: DriveStatus;
+  drive_error: string | null;
+  drive_link: string | null;
 }
 
 interface StagedItem {
@@ -25,6 +31,7 @@ interface StagedItem {
   file: File;
   courseName: string;
   unitNumber: string;
+  chapterNumber: string;
 }
 
 export default function Home() {
@@ -65,6 +72,7 @@ export default function Home() {
       file,
       courseName,
       unitNumber: `Unit ${startUnit + i}`,
+      chapterNumber: "",
     }));
     setStaged((prev) => [...prev, ...additions]);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -97,6 +105,7 @@ export default function Home() {
         const form = new FormData();
         form.append("course_name", item.courseName);
         form.append("unit_number", item.unitNumber);
+        form.append("chapter_number", item.chapterNumber);
         form.append("video", item.file);
         const res = await fetch(`${API_URL}/jobs`, { method: "POST", body: form });
         if (!res.ok) {
@@ -110,6 +119,29 @@ export default function Home() {
       setError(err.message || "Failed to queue one or more videos.");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function saveToDrive(jobId: string) {
+    // Optimistically flip the button to "saving" so it feels instant;
+    // the next poll tick (≤2s) will confirm from the server either way.
+    setJobs((prev) =>
+      prev.map((j) => (j.job_id === jobId ? { ...j, drive_status: "saving", drive_error: null } : j))
+    );
+    try {
+      const res = await fetch(`${API_URL}/jobs/${jobId}/drive`, { method: "POST" });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(detail || `${res.status}`);
+      }
+    } catch (err: any) {
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.job_id === jobId ? { ...j, drive_status: "failed", drive_error: err.message || "Failed to start save" } : j
+        )
+      );
+    } finally {
+      fetchJobs();
     }
   }
 
@@ -151,7 +183,7 @@ export default function Home() {
                 key={item.key}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1fr 140px 32px",
+                  gridTemplateColumns: "1fr 120px 120px 32px",
                   gap: 8,
                   alignItems: "center",
                   background: "#0d3b54",
@@ -166,7 +198,13 @@ export default function Home() {
                   style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
                   value={item.unitNumber}
                   onChange={(e) => updateStaged(item.key, { unitNumber: e.target.value })}
-                  placeholder="e.g. UNIT 03 | CHAPTER 06"
+                  placeholder="Unit number, e.g. UNIT 03"
+                />
+                <input
+                  style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
+                  value={item.chapterNumber}
+                  onChange={(e) => updateStaged(item.key, { chapterNumber: e.target.value })}
+                  placeholder="Chapter number, e.g. CHAPTER 06"
                 />
                 <button
                   onClick={() => removeStaged(item.key)}
@@ -210,7 +248,7 @@ export default function Home() {
 
         <div style={{ display: "grid", gap: 12 }}>
           {jobs.map((job) => (
-            <JobCard key={job.job_id} job={job} />
+            <JobCard key={job.job_id} job={job} onSaveToDrive={saveToDrive} />
           ))}
         </div>
       </section>
@@ -218,7 +256,7 @@ export default function Home() {
   );
 }
 
-function JobCard({ job }: { job: Job }) {
+function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
   const badge = statusBadge(job.status);
 
@@ -228,6 +266,7 @@ function JobCard({ job }: { job: Job }) {
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 600, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {job.course_name} — {job.unit_number}
+            {job.chapter_number ? ` — ${job.chapter_number}` : ""}
           </div>
           <div style={{ fontSize: 12, color: "#7fa9b8" }}>{job.original_filename}</div>
         </div>
@@ -281,12 +320,45 @@ function JobCard({ job }: { job: Job }) {
       )}
 
       {job.status === "done" && job.result_filename && (
-        <a
-          href={`${API_URL}/jobs/${job.job_id}/file`}
-          style={{ ...buttonStyle(false), display: "inline-block", marginTop: 12, textDecoration: "none", padding: "8px 16px", fontSize: 13 }}
-        >
-          ⬇ Download
-        </a>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <a
+            href={`${API_URL}/jobs/${job.job_id}/file`}
+            style={{ ...buttonStyle(false), display: "inline-block", textDecoration: "none", padding: "8px 16px", fontSize: 13 }}
+          >
+            ⬇ Download
+          </a>
+
+          {job.drive_status === "saved" ? (
+            <a
+              href={job.drive_link || "#"}
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: "#8fe8b0", fontSize: 13, textDecoration: "none" }}
+            >
+              ✅ Saved to Google Drive — open folder
+            </a>
+          ) : (
+            <button
+              onClick={() => onSaveToDrive(job.job_id)}
+              disabled={job.drive_status === "saving"}
+              style={{
+                ...buttonStyle(job.drive_status === "saving"),
+                background: job.drive_status === "saving" ? "#3a6a76" : "#4285F4",
+                color: "#fff",
+                padding: "8px 16px",
+                fontSize: 13,
+              }}
+            >
+              {job.drive_status === "saving" ? "Saving to Drive…" : "📁 Save to Google Drive"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {job.drive_status === "failed" && job.drive_error && (
+        <div style={{ color: "#ff8a8a", fontSize: 12, marginTop: 6 }}>
+          ⚠️ Drive save failed: {job.drive_error}
+        </div>
       )}
     </div>
   );
