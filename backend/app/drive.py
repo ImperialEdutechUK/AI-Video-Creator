@@ -2,12 +2,10 @@
 """
 Google Drive integration for the "Save to Google Drive" feature.
 
-Uses a Google Cloud *service account* rather than per-user OAuth, so saving
-is genuinely one-click from the UI — nobody has to sign in or approve a
-consent screen. The trade-off is a one-time setup step: the target Drive
-folder has to be *shared with the service account's email address* before
-uploads will work (service accounts don't have their own visible "My
-Drive", they only see what's explicitly shared with them).
+Saving is one-click from the UI — nobody signs in or approves a consent
+screen at use time. The backend holds a single set of credentials that it
+uses for every upload; the one-time setup is generating those credentials
+(see the configuration block below).
 
 Folder layout produced on Drive:
 
@@ -19,14 +17,23 @@ Folder layout produced on Drive:
       <Another Course>/
         ...
 
-Configuration (env vars, set on Railway):
-  GOOGLE_SERVICE_ACCOUNT_JSON   the full service-account key JSON, as a
-                                 single-line string (recommended for Railway)
-  GOOGLE_SERVICE_ACCOUNT_FILE   path to a key JSON file instead, if you'd
-                                 rather mount it as a file
-  GOOGLE_DRIVE_ROOT_FOLDER_ID   the Drive folder everything gets organised
-                                 under. Defaults to the folder you shared:
-                                 https://drive.google.com/drive/folders/1cY7v7956TyrJbGPGno4QQJ5Zpj6bXDjZ
+Configuration (env vars, set on Railway) — preferred OAuth mode, identical
+to the Podcast Creator so the same values can be pasted into both services:
+
+  GDRIVE_CLIENT_ID        OAuth client ID   (xxx.apps.googleusercontent.com)
+  GDRIVE_CLIENT_SECRET    OAuth client secret
+  GDRIVE_REFRESH_TOKEN    long-lived refresh token generated once, locally
+  GDRIVE_FOLDER_URL       the root Drive folder — full URL or bare ID
+
+Legacy service-account mode is still supported as a fallback:
+
+  GOOGLE_SERVICE_ACCOUNT_JSON   full key JSON as a single-line string
+  GOOGLE_SERVICE_ACCOUNT_FILE   path to a key JSON file instead
+  GOOGLE_DRIVE_ROOT_FOLDER_ID   root folder ID
+
+Only use the service-account mode if the root folder lives inside a Google
+Workspace **Shared Drive** — service accounts have no storage quota of
+their own and cannot own files in a personal My Drive.
 """
 import json
 import os
@@ -35,7 +42,9 @@ import threading
 import unicodedata
 from pathlib import Path
 
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
@@ -45,7 +54,32 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 # The folder ID from the link you shared. Overridable via env var so this
 # can point at a different root without a code change.
 DEFAULT_ROOT_FOLDER_ID = "1cY7v7956TyrJbGPGno4QQJ5Zpj6bXDjZ"
-ROOT_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID", DEFAULT_ROOT_FOLDER_ID)
+
+
+def _extract_folder_id(value: str) -> str:
+    """Accept either a bare folder ID or a full Drive folder URL, so
+    GDRIVE_FOLDER_URL can be pasted straight from the browser address bar
+    (this matches how the Podcast Creator reads the same variable)."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    return value  # already a bare ID
+
+
+def _root_folder_id() -> str:
+    """Resolved per call rather than at import time, so changing the
+    Railway variable takes effect on restart without a code change."""
+    return (
+        _extract_folder_id(os.environ.get("GDRIVE_FOLDER_URL", ""))
+        or _extract_folder_id(os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID", ""))
+        or DEFAULT_ROOT_FOLDER_ID
+    )
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
@@ -76,6 +110,35 @@ def _clean(name: str, max_len: int = 120) -> str:
 
 
 def _get_credentials():
+    """Two supported modes, checked in this order:
+
+    1. **OAuth refresh token** (GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET /
+       GDRIVE_REFRESH_TOKEN) — the same scheme the Podcast Creator uses.
+       Uploads happen *as you*, using your own Drive storage quota, so an
+       ordinary personal My Drive folder works fine. Preferred.
+    2. **Service account** (GOOGLE_SERVICE_ACCOUNT_JSON / _FILE) — kept as
+       a fallback, but note a service account has no storage quota of its
+       own and can therefore only write inside a Workspace Shared Drive.
+    """
+    client_id = os.environ.get("GDRIVE_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GDRIVE_CLIENT_SECRET", "").strip()
+    refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
+
+    if client_id and client_secret and refresh_token:
+        creds = UserCredentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=SCOPES,
+        )
+        # Exchange the long-lived refresh token for a short-lived access
+        # token now, so a bad credential fails here with a clear message
+        # rather than midway through a large upload.
+        creds.refresh(GoogleAuthRequest())
+        return creds
+
     raw_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
 
@@ -84,10 +147,11 @@ def _get_credentials():
         return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     if key_file:
         return service_account.Credentials.from_service_account_file(key_file, scopes=SCOPES)
+
     raise DriveNotConfigured(
-        "Google Drive isn't configured yet. Set GOOGLE_SERVICE_ACCOUNT_JSON "
-        "(or GOOGLE_SERVICE_ACCOUNT_FILE) on the backend, and make sure the "
-        "target Drive folder is shared with that service account's email."
+        "Google Drive isn't configured yet. Set GDRIVE_CLIENT_ID, "
+        "GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN and GDRIVE_FOLDER_URL on "
+        "the backend (the same four values the Podcast Creator uses)."
     )
 
 
@@ -141,9 +205,10 @@ def get_or_create_course_folder(course_name: str) -> str:
         return cached
 
     service = get_service()
-    folder_id = _find_folder(service, clean_name, ROOT_FOLDER_ID)
+    root_id = _root_folder_id()
+    folder_id = _find_folder(service, clean_name, root_id)
     if not folder_id:
-        folder_id = _create_folder(service, clean_name, ROOT_FOLDER_ID)
+        folder_id = _create_folder(service, clean_name, root_id)
 
     with _folder_cache_lock:
         _folder_cache[cache_key] = folder_id
