@@ -37,6 +37,7 @@ from pathlib import Path
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -98,7 +99,10 @@ def get_service():
     with _service_lock:
         if _service is None:
             creds = _get_credentials()
-            _service = build("drive", "v3", credentials=creds, cacheDiscovery=False)
+            # NOTE: the keyword is cache_discovery (snake_case), not
+            # cacheDiscovery. On google-api-python-client 2.x static
+            # discovery is the default anyway, so it's simply omitted.
+            _service = build("drive", "v3", credentials=creds)
         return _service
 
 
@@ -166,9 +170,14 @@ def upload_video(course_name: str, unit_number: str, chapter_number: str,
     request = service.files().create(
         body=metadata, media_body=media, fields="id, name, webViewLink",
     )
-    response = None
-    while response is None:
-        _status, response = request.next_chunk()
+    try:
+        response = None
+        while response is None:
+            _status, response = request.next_chunk()
+    except HttpError as e:
+        # The raw Google errors are unreadable in the UI, so translate the
+        # handful that actually come up during setup.
+        raise RuntimeError(_explain_drive_error(e)) from e
 
     return {
         "file_id": response["id"],
@@ -176,3 +185,37 @@ def upload_video(course_name: str, unit_number: str, chapter_number: str,
         "web_view_link": response.get("webViewLink"),
         "folder_id": folder_id,
     }
+
+
+def _explain_drive_error(exc: Exception) -> str:
+    """Turn the common Google Drive setup failures into messages that say
+    what to actually go and fix, since these surface directly in the UI."""
+    text = str(exc)
+
+    if "storageQuotaExceeded" in text:
+        return (
+            "Drive rejected the upload because the service account has no "
+            "storage of its own. Make sure the root folder lives in a real "
+            "Google account's Drive and is shared with the service account's "
+            "client_email as an Editor."
+        )
+    if "notFound" in text or "File not found" in text:
+        return (
+            "Drive could not find the root folder. Check that "
+            "GOOGLE_DRIVE_ROOT_FOLDER_ID is just the ID from the URL (no "
+            "https://, no ?usp=sharing) and that the folder is shared with "
+            "the service account."
+        )
+    if "insufficientFilePermissions" in text or "forbidden" in text.lower():
+        return (
+            "The service account can see the folder but cannot write to it. "
+            "Re-share the folder with its client_email and set the role to "
+            "Editor rather than Viewer."
+        )
+    if "invalid_grant" in text:
+        return (
+            "Authentication failed. The private key in "
+            "GOOGLE_SERVICE_ACCOUNT_JSON is likely malformed — re-paste the "
+            "key file contents into the Railway variable."
+        )
+    return f"Google Drive error: {text}"
