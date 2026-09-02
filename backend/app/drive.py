@@ -114,6 +114,7 @@ def _find_folder(service, name: str, parent_id: str) -> str | None:
     )
     resp = service.files().list(
         q=query, spaces="drive", fields="files(id, name)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
@@ -121,7 +122,9 @@ def _find_folder(service, name: str, parent_id: str) -> str | None:
 
 def _create_folder(service, name: str, parent_id: str) -> str:
     metadata = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
-    folder = service.files().create(body=metadata, fields="id").execute()
+    folder = service.files().create(
+        body=metadata, fields="id", supportsAllDrives=True,
+    ).execute()
     return folder["id"]
 
 
@@ -169,6 +172,7 @@ def upload_video(course_name: str, unit_number: str, chapter_number: str,
 
     request = service.files().create(
         body=metadata, media_body=media, fields="id, name, webViewLink",
+        supportsAllDrives=True,
     )
     try:
         response = None
@@ -194,10 +198,12 @@ def _explain_drive_error(exc: Exception) -> str:
 
     if "storageQuotaExceeded" in text:
         return (
-            "Drive rejected the upload because the service account has no "
-            "storage of its own. Make sure the root folder lives in a real "
-            "Google account's Drive and is shared with the service account's "
-            "client_email as an Editor."
+            "The service account has no storage quota of its own, so it "
+            "cannot own files in a personal My Drive. Move the root folder "
+            "into a Google Workspace Shared Drive, add the service account "
+            "as a member with Content manager access, and point "
+            "GOOGLE_DRIVE_ROOT_FOLDER_ID at a folder inside that Shared "
+            "Drive. Sharing a normal My Drive folder is not enough."
         )
     if "notFound" in text or "File not found" in text:
         return (
