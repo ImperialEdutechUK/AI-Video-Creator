@@ -7,7 +7,7 @@ Endpoints:
   GET  /jobs              list all jobs (newest first) — powers the frontend's queue view
   GET  /jobs/{id}         poll one job's status/progress
   GET  /jobs/{id}/file    download the finished mp4
-  GET  /healthz           liveness check for Railway
+  GET  /healthz           liveness check for Railway + Drive config state
 
 Jobs run through a small bounded worker pool instead of one thread per
 upload. This matters for both correctness of the "queue" (jobs beyond the
@@ -123,7 +123,21 @@ def _startup():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "workers": WORKERS, "queue_depth": JOB_QUEUE.qsize()}
+    """Liveness check, plus the Drive configuration state.
+
+    drive_auth_mode is the field to look at when "Save to Google Drive"
+    fails: "oauth" means uploads go through a real Google account (correct
+    for a personal My Drive folder), "service_account" means they do not
+    and will hit storageQuotaExceeded outside a Shared Drive. A single
+    missing GDRIVE_* variable is enough to silently drop to the fallback,
+    so this is checked here rather than guessed at."""
+    return {
+        "ok": True,
+        "workers": WORKERS,
+        "queue_depth": JOB_QUEUE.qsize(),
+        "drive_auth_mode": drive.auth_mode(),
+        "drive_root_folder_id": drive._root_folder_id(),
+    }
 
 
 @app.post("/jobs")
