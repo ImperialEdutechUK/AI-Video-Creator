@@ -242,10 +242,9 @@ def get_or_create_course_folder(course_name: str) -> str:
 
 
 def build_drive_filename(course_name: str, unit_number: str, chapter_number: str) -> str:
-    """course name + unit number + chapter number. Chapter is optional —
-    some courses are organised by unit alone — so it drops out when blank."""
-    parts = [p for p in (course_name, unit_number, chapter_number) if p and p.strip()]
-    return _clean(" - ".join(p.strip() for p in parts)) + ".mp4"
+    """Create Drive filenames using only the Unit and Chapter format."""
+    parts = [p.strip() for p in (unit_number, chapter_number) if p and p.strip()]
+    return _clean(" | ".join(parts)) + ".mp4"
 
 
 # ── upload ───────────────────────────────────────────────────────────────

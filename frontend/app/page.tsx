@@ -90,8 +90,8 @@ export default function Home() {
     setError(null);
     if (staged.length === 0) return;
     for (const item of staged) {
-      if (!item.courseName.trim() || !item.unitNumber.trim()) {
-        setError("Every queued video needs a course name and unit number.");
+      if (!item.courseName.trim() || !item.unitNumber.trim() || !item.chapterNumber.trim()) {
+        setError("Every queued video needs a course name, unit number and chapter number.");
         return;
       }
     }
@@ -161,7 +161,11 @@ export default function Home() {
           <input
             style={inputStyle}
             value={courseName}
-            onChange={(e) => setCourseName(e.target.value)}
+            onChange={(e) => {
+              const value = e.target.value;
+              setCourseName(value);
+              setStaged((prev) => prev.map((item) => ({ ...item, courseName: value })));
+            }}
             placeholder="e.g. Intro to Biology"
           />
         </label>
@@ -196,16 +200,19 @@ export default function Home() {
                 </div>
                 <input
                   style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
-                  value={item.unitNumber}
-                  onChange={(e) => updateStaged(item.key, { unitNumber: e.target.value })}
-                  placeholder="Unit number, e.g. UNIT 03"
+                  value={item.unitNumber.replace("Unit ", "")}
+                  onChange={(e) => updateStaged(item.key, { unitNumber: `Unit ${e.target.value.replace(/\D/g, "")}` })}
+                  placeholder="1"
                 />
                 <input
                   style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
-                  value={item.chapterNumber}
-                  onChange={(e) => updateStaged(item.key, { chapterNumber: e.target.value })}
-                  placeholder="Chapter number, e.g. CHAPTER 06"
+                  value={item.chapterNumber.replace("Chapter ", "")}
+                  onChange={(e) => updateStaged(item.key, { chapterNumber: `Chapter ${e.target.value.replace(/\D/g, "")}` })}
+                  placeholder="1"
                 />
+                <div style={{ gridColumn: "1 / span 3", fontSize: 12, color: "#9fc4d4" }}>
+                  {item.unitNumber || "Unit ?"} | {item.chapterNumber || "Chapter ?"}
+                </div>
                 <button
                   onClick={() => removeStaged(item.key)}
                   title="Remove"
