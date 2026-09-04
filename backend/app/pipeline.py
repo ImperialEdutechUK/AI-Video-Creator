@@ -198,7 +198,7 @@ def _make_box_png(boxes, path, W=1920, H=1080, colour=(255,255,255,255)):
 
 
 # ──────────────────── PILLOW OVERLAYS ────────────────────────────────────
-def render_intro_overlay(course, unit_num, unit_title, W=1920, H=1080):
+def render_intro_overlay(course, unit_num, chapter_number, W=1920, H=1080):
     img  = Image.new("RGBA", (W, H), (0,0,0,0))
     draw = ImageDraw.Draw(img)
     pad  = W - 200
@@ -208,27 +208,27 @@ def render_intro_overlay(course, unit_num, unit_title, W=1920, H=1080):
         if bb[2]-bb[0] <= pad: break
         csz -= 2; cfn = _ft(BOLD, csz)
     c_asc, c_desc = cfn.getmetrics(); c_h = c_asc+c_desc
-    ufn  = _ft(BOLD, 28); utxt = unit_num.upper()
+    # Unit and chapter live in the same badge, e.g. "UNIT 2 | CHAPTER 3" —
+    # chapter is appended only when present so a video with no chapter
+    # number still gets a clean "UNIT 2" badge.
+    badge_parts = [p.strip() for p in (unit_num, chapter_number) if p and p.strip()]
+    utxt = " | ".join(badge_parts).upper()
+    ufn_size = 28
+    ufn  = _ft(BOLD, ufn_size)
     bb   = draw.textbbox((0,0), utxt, font=ufn)
     badge_w = bb[2]-bb[0]+70; badge_h = 56
-    has_title = bool(unit_title and unit_title.strip()); title_h = 0
-    if has_title:
-        tsz = 30; tfn = _ft(MEDIUM, tsz)
-        while tsz > 20:
-            bb = draw.textbbox((0,0), unit_title, font=tfn)
-            if bb[2]-bb[0] <= pad: break
-            tsz -= 2; tfn = _ft(MEDIUM, tsz)
-        t_asc, t_desc = tfn.getmetrics(); title_h = t_asc+t_desc
-    gap1 = 45; gap2 = 25
-    block_h = c_h+gap1+badge_h+(gap2+title_h if has_title else 0)
+    while badge_w > pad and ufn_size > 16:
+        ufn_size -= 2
+        ufn  = _ft(BOLD, ufn_size)
+        bb   = draw.textbbox((0,0), utxt, font=ufn)
+        badge_w = bb[2]-bb[0]+70
+    gap1 = 45
+    block_h = c_h+gap1+badge_h
     start_y = (H//2-60)-block_h//2
     draw.text((W//2, start_y+c_h//2), course, fill=WHITE, font=cfn, anchor="mm")
     bx = (W-badge_w)//2; by = start_y+c_h+gap1
     draw.rounded_rectangle([bx,by,bx+badge_w,by+badge_h], radius=14, fill=TEAL+(230,))
     draw.text((bx+badge_w//2, by+badge_h//2), utxt, fill=WHITE, font=ufn, anchor="mm")
-    if has_title:
-        ty2 = by+badge_h+gap2
-        draw.text((W//2, ty2+title_h//2), unit_title, fill=WHITE, font=tfn, anchor="mm")
     return img
 
 
@@ -466,9 +466,9 @@ def _detect_end_card_start(path, progress_cb=None):
     return precise
 
 
-def make_intro(course, unit_num, unit_title, tmp):
+def make_intro(course, unit_num, chapter_number, tmp):
     png = str(tmp/"intro_overlay.png"); out = str(tmp/"intro.mp4")
-    render_intro_overlay(course, unit_num, unit_title).save(png, "PNG")
+    render_intro_overlay(course, unit_num, chapter_number).save(png, "PNG")
     y = "if(lt(t\\,0.8)\\,300*pow(1-t/0.8\\,2)\\,0)"
     _ff(["ffmpeg","-y","-i",str(INTRO_TPL),"-loop","1","-i",png,"-filter_complex",
         f"[1:v]format=rgba[ovr];[0:v][ovr]overlay=x=0:y='{y}':shortest=1[out]",
@@ -1451,7 +1451,7 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     return data, fn
 
 
-def preview_frame(course, unit_num, unit_title):
+def preview_frame(course, unit_num, chapter_number):
     if not INTRO_TPL.exists(): raise FileNotFoundError(f"Missing: {INTRO_TPL}")
     fd, tp = tempfile.mkstemp(suffix=".png"); os.close(fd)
     try:
@@ -1461,6 +1461,6 @@ def preview_frame(course, unit_num, unit_title):
     finally:
         try: os.unlink(tp)
         except: pass
-    comp = Image.alpha_composite(bg, render_intro_overlay(course,unit_num,unit_title)).convert("RGB")
+    comp = Image.alpha_composite(bg, render_intro_overlay(course,unit_num,chapter_number)).convert("RGB")
     buf = BytesIO(); comp.save(buf,"JPEG",quality=90); buf.seek(0)
     return buf
