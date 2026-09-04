@@ -59,12 +59,28 @@ export default function Home() {
     };
   }, []);
 
+  const removingRef = useRef<Set<string>>(new Set());
+
   async function fetchJobs() {
     try {
       const res = await fetch(`${API_URL}/jobs`);
       if (!res.ok) return;
       const data = await res.json();
-      setJobs(data.jobs || []);
+      const incoming: Job[] = data.jobs || [];
+
+      // Once a video is safely saved to Drive there's no reason to keep it
+      // cluttering the shared queue — remove it for everyone as soon as any
+      // client observes drive_status "saved". removingRef guards against
+      // firing the DELETE more than once while the backend catches up.
+      const toRemove = incoming.filter((j) => j.drive_status === "saved" && !removingRef.current.has(j.job_id));
+      for (const job of toRemove) {
+        removingRef.current.add(job.job_id);
+        fetch(`${API_URL}/jobs/${job.job_id}`, { method: "DELETE" }).catch(() => {
+          removingRef.current.delete(job.job_id);
+        });
+      }
+
+      setJobs(incoming.filter((j) => !removingRef.current.has(j.job_id)));
     } catch {
       // transient network hiccup — next tick retries
     }

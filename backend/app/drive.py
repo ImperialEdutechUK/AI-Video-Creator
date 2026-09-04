@@ -9,12 +9,14 @@ for every upload; the only setup is generating those credentials once.
 Folder layout produced on Drive:
 
     <ROOT_FOLDER>/
-      <Course Name>/                              (created once, reused after)
-        <Course Name> - <Unit Number> - <Chapter Number>.mp4
-        <Course Name> - <Unit Number> - <Chapter Number>.mp4
+      <Awarding Body> - <Course Name>/      (created once, reused after)
+        <Unit Number> | <Chapter Number>.mp4
+        <Unit Number> | <Chapter Number>.mp4
         ...
-      <Another Course>/
+      <Another Body> - <Another Course>/
         ...
+
+    (Falls back to just "<Course Name>" when no awarding body was set.)
 
 CONFIGURATION (env vars on the Railway backend service)
 
@@ -213,10 +215,15 @@ def _create_folder(service, name: str, parent_id: str) -> str:
     return folder["id"]
 
 
-def get_or_create_course_folder(course_name: str) -> str:
+def get_or_create_course_folder(course_name: str, awarding_body: str = "") -> str:
     """Find this course's folder under the root, or create it on the first
-    video for that course and reuse it for every unit/chapter after."""
-    clean_name = _clean(course_name)
+    video for that course and reuse it for every unit/chapter after.
+    Folder name is "<Awarding Body> - <Course Name>" when an awarding body
+    was given, so videos for the same course under different awarding
+    bodies don't collide into one folder; falls back to just the course
+    name when awarding body is blank."""
+    parts = [p.strip() for p in (awarding_body, course_name) if p and p.strip()]
+    clean_name = _clean(" - ".join(parts))
     cache_key = clean_name.lower()
 
     with _folder_cache_lock:
@@ -250,11 +257,11 @@ def build_drive_filename(course_name: str, unit_number: str, chapter_number: str
 # ── upload ───────────────────────────────────────────────────────────────
 
 def upload_video(course_name: str, unit_number: str, chapter_number: str,
-                 file_path: str | Path) -> dict:
-    """Upload one finished video into <root>/<course name>/. Returns
-    {file_id, name, web_view_link, folder_id}."""
+                 file_path: str | Path, awarding_body: str = "") -> dict:
+    """Upload one finished video into <root>/<awarding body - course name>/.
+    Returns {file_id, name, web_view_link, folder_id}."""
     service = get_service()
-    folder_id = get_or_create_course_folder(course_name)
+    folder_id = get_or_create_course_folder(course_name, awarding_body)
     filename = build_drive_filename(course_name, unit_number, chapter_number)
 
     metadata = {"name": filename, "parents": [folder_id]}

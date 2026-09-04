@@ -7,6 +7,8 @@ Endpoints:
   GET  /jobs              list all jobs (newest first) — powers the frontend's queue view
   GET  /jobs/{id}         poll one job's status/progress
   GET  /jobs/{id}/file    download the finished mp4
+  POST /jobs/{id}/drive   save the finished mp4 into Google Drive
+  DELETE /jobs/{id}       remove a finished/failed job from the queue
   GET  /healthz           liveness check for Railway + Drive config state
 
 Jobs run through a small bounded worker pool instead of one thread per
@@ -249,10 +251,14 @@ def _run_drive_save(job_id: str):
         course_name = job["course_name"]
         unit_number = job["unit_number"]
         chapter_number = job.get("chapter_number", "")
+        awarding_body = job.get("awarding_body", "")
         result_path = job["result_path"]
 
     try:
-        result = drive.upload_video(course_name, unit_number, chapter_number, result_path)
+        result = drive.upload_video(
+            course_name, unit_number, chapter_number, result_path,
+            awarding_body=awarding_body,
+        )
         with JOBS_LOCK:
             JOBS[job_id]["drive_status"] = "saved"
             JOBS[job_id]["drive_link"] = result["web_view_link"]
@@ -281,3 +287,22 @@ def save_to_drive(job_id: str):
 
     threading.Thread(target=_run_drive_save, args=(job_id,), daemon=True).start()
     return {"drive_status": "saving"}
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str):
+    """Remove a job from the queue and clean up its on-disk result. Used by
+    the frontend right after a successful Drive save, since once a video is
+    safely in Drive there's no reason to keep it cluttering the shared
+    queue — but it works for any finished/failed job the team wants to
+    clear, not just Drive-saved ones."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        if job["status"] in ("queued", "processing"):
+            raise HTTPException(409, "Can't remove a job that hasn't finished yet")
+        del JOBS[job_id]
+
+    shutil.rmtree(WORK_ROOT / job_id, ignore_errors=True)
+    return {"deleted": True}
