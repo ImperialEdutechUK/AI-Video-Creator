@@ -198,16 +198,39 @@ def _make_box_png(boxes, path, W=1920, H=1080, colour=(255,255,255,255)):
 
 
 # ──────────────────── PILLOW OVERLAYS ────────────────────────────────────
-def render_intro_overlay(course, unit_num, chapter_number, W=1920, H=1080):
+def _fit_bold_text(draw, text, pad, start_size=52, min_size=28):
+    """Shrink-to-fit a bold line of text within `pad` px, returning the
+    chosen font and its (width, height). Shared by the awarding body and
+    course name lines so they always render with identical size/style
+    logic — only the specific text differs."""
+    size = start_size
+    fn = _ft(BOLD, size)
+    while size > min_size:
+        bb = draw.textbbox((0, 0), text, font=fn)
+        if bb[2] - bb[0] <= pad:
+            break
+        size -= 2
+        fn = _ft(BOLD, size)
+    asc, desc = fn.getmetrics()
+    return fn, asc + desc
+
+
+def render_intro_overlay(course, unit_num, chapter_number, awarding_body="", W=1920, H=1080):
     img  = Image.new("RGBA", (W, H), (0,0,0,0))
     draw = ImageDraw.Draw(img)
     pad  = W - 200
-    csz  = 52; cfn = _ft(BOLD, csz)
-    while csz > 28:
-        bb = draw.textbbox((0,0), course, font=cfn)
-        if bb[2]-bb[0] <= pad: break
-        csz -= 2; cfn = _ft(BOLD, csz)
-    c_asc, c_desc = cfn.getmetrics(); c_h = c_asc+c_desc
+
+    # Awarding body (optional) renders centered above the course name,
+    # using the exact same bold/shrink-to-fit styling as the course name
+    # itself — only omitted from the layout when left blank.
+    has_awarding = bool(awarding_body and awarding_body.strip())
+    if has_awarding:
+        afn, a_h = _fit_bold_text(draw, awarding_body, pad)
+    else:
+        a_h = 0
+
+    cfn, c_h = _fit_bold_text(draw, course, pad)
+
     # Unit and chapter live in the same badge, e.g. "UNIT 2 | CHAPTER 3" —
     # chapter is appended only when present so a video with no chapter
     # number still gets a clean "UNIT 2" badge.
@@ -222,11 +245,18 @@ def render_intro_overlay(course, unit_num, chapter_number, W=1920, H=1080):
         ufn  = _ft(BOLD, ufn_size)
         bb   = draw.textbbox((0,0), utxt, font=ufn)
         badge_w = bb[2]-bb[0]+70
-    gap1 = 45
-    block_h = c_h+gap1+badge_h
-    start_y = (H//2-60)-block_h//2
-    draw.text((W//2, start_y+c_h//2), course, fill=WHITE, font=cfn, anchor="mm")
-    bx = (W-badge_w)//2; by = start_y+c_h+gap1
+
+    gap0 = 20   # awarding body -> course name
+    gap1 = 45   # course name -> badge
+    block_h = (a_h + gap0 if has_awarding else 0) + c_h + gap1 + badge_h
+    cur_y = (H//2-60)-block_h//2
+
+    if has_awarding:
+        draw.text((W//2, cur_y+a_h//2), awarding_body, fill=WHITE, font=afn, anchor="mm")
+        cur_y += a_h + gap0
+
+    draw.text((W//2, cur_y+c_h//2), course, fill=WHITE, font=cfn, anchor="mm")
+    bx = (W-badge_w)//2; by = cur_y+c_h+gap1
     draw.rounded_rectangle([bx,by,bx+badge_w,by+badge_h], radius=14, fill=TEAL+(230,))
     draw.text((bx+badge_w//2, by+badge_h//2), utxt, fill=WHITE, font=ufn, anchor="mm")
     return img
@@ -466,9 +496,9 @@ def _detect_end_card_start(path, progress_cb=None):
     return precise
 
 
-def make_intro(course, unit_num, chapter_number, tmp):
+def make_intro(course, unit_num, chapter_number, awarding_body, tmp):
     png = str(tmp/"intro_overlay.png"); out = str(tmp/"intro.mp4")
-    render_intro_overlay(course, unit_num, chapter_number).save(png, "PNG")
+    render_intro_overlay(course, unit_num, chapter_number, awarding_body).save(png, "PNG")
     y = "if(lt(t\\,0.8)\\,300*pow(1-t/0.8\\,2)\\,0)"
     _ff(["ffmpeg","-y","-i",str(INTRO_TPL),"-loop","1","-i",png,"-filter_complex",
         f"[1:v]format=rgba[ovr];[0:v][ovr]overlay=x=0:y='{y}':shortest=1[out]",
@@ -1389,7 +1419,8 @@ def ensure_assets():
 
 
 def process_video(course_name: str, unit_number: str, video_bytes: bytes,
-                   tmp: Path, progress_cb=None, chapter_number: str = "") -> tuple[bytes, str]:
+                   tmp: Path, progress_cb=None, chapter_number: str = "",
+                   awarding_body: str = "") -> tuple[bytes, str]:
     """Run the full merge pipeline on raw video bytes. Returns
     (output_bytes, output_filename). This is the same sequence the
     original Streamlit queue used: normalise -> intro/outro -> remove
@@ -1401,6 +1432,7 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     course_name = _clean_text_field(course_name)
     unit_number = _clean_text_field(unit_number, max_len=40)
     chapter_number = _clean_text_field(chapter_number, max_len=40)
+    awarding_body = _clean_text_field(awarding_body)
 
     raw = tmp / "raw.mp4"
     raw.write_bytes(video_bytes)
@@ -1422,7 +1454,7 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [
             pool.submit(_job, "norm", normalise, raw, tmp / "norm.mp4"),
-            pool.submit(_job, "intro", make_intro, course_name, unit_number, chapter_number, tmp),
+            pool.submit(_job, "intro", make_intro, course_name, unit_number, chapter_number, awarding_body, tmp),
             pool.submit(_job, "outro", make_outro, tmp),
         ]
         for f in futures:
@@ -1451,7 +1483,7 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     return data, fn
 
 
-def preview_frame(course, unit_num, chapter_number):
+def preview_frame(course, unit_num, chapter_number, awarding_body=""):
     if not INTRO_TPL.exists(): raise FileNotFoundError(f"Missing: {INTRO_TPL}")
     fd, tp = tempfile.mkstemp(suffix=".png"); os.close(fd)
     try:
@@ -1461,6 +1493,6 @@ def preview_frame(course, unit_num, chapter_number):
     finally:
         try: os.unlink(tp)
         except: pass
-    comp = Image.alpha_composite(bg, render_intro_overlay(course,unit_num,chapter_number)).convert("RGB")
+    comp = Image.alpha_composite(bg, render_intro_overlay(course,unit_num,chapter_number,awarding_body)).convert("RGB")
     buf = BytesIO(); comp.save(buf,"JPEG",quality=90); buf.seek(0)
     return buf

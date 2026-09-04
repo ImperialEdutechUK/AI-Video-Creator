@@ -86,9 +86,9 @@ def _run_job(job_id: str):
     with JOBS_LOCK:
         job = JOBS[job_id]
         job["status"] = "processing"
-        course_name, unit_number, chapter_number, video_bytes = (
+        course_name, unit_number, chapter_number, awarding_body, video_bytes = (
             job["course_name"], job["unit_number"], job.get("chapter_number", ""),
-            job.pop("_video_bytes"),
+            job.get("awarding_body", ""), job.pop("_video_bytes"),
         )
 
     def progress_cb(msg: str):
@@ -102,7 +102,7 @@ def _run_job(job_id: str):
     try:
         data, filename = pipeline.process_video(
             course_name, unit_number, video_bytes, scratch, progress_cb=progress_cb,
-            chapter_number=chapter_number,
+            chapter_number=chapter_number, awarding_body=awarding_body,
         )
         out_path = job_dir / filename
         out_path.write_bytes(data)
@@ -151,6 +151,7 @@ async def create_job(
     course_name: str = Form(...),
     unit_number: str = Form(...),
     chapter_number: str = Form(""),
+    awarding_body: str = Form(""),
     video: UploadFile = File(...),
 ):
     if not video.filename:
@@ -172,6 +173,7 @@ async def create_job(
             "course_name": course_name,
             "unit_number": unit_number,
             "chapter_number": chapter_number,
+            "awarding_body": awarding_body,
             "original_filename": video.filename,
             "created_at": time.time(),
             "_video_bytes": video_bytes,
@@ -198,6 +200,7 @@ def _public_job(job_id: str, job: dict) -> dict:
         "course_name": job["course_name"],
         "unit_number": job["unit_number"],
         "chapter_number": job.get("chapter_number", ""),
+        "awarding_body": job.get("awarding_body", ""),
         "created_at": job["created_at"],
         "drive_status": job.get("drive_status", "idle"),
         "drive_error": job.get("drive_error"),

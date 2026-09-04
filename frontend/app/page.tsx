@@ -20,6 +20,7 @@ interface Job {
   course_name: string;
   unit_number: string;
   chapter_number: string;
+  awarding_body: string;
   created_at: number;
   drive_status: DriveStatus;
   drive_error: string | null;
@@ -29,12 +30,14 @@ interface Job {
 interface StagedItem {
   key: string;
   file: File;
+  awardingBody: string;
   courseName: string;
   unitNumber: string;
   chapterNumber: string;
 }
 
 export default function Home() {
+  const [awardingBody, setAwardingBody] = useState("");
   const [courseName, setCourseName] = useState("");
   const [staged, setStaged] = useState<StagedItem[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -70,6 +73,7 @@ export default function Home() {
     const additions: StagedItem[] = Array.from(files).map((file, i) => ({
       key: `${file.name}-${file.size}-${Date.now()}-${i}`,
       file,
+      awardingBody,
       courseName,
       unitNumber: `Unit ${startUnit + i}`,
       chapterNumber: "",
@@ -114,6 +118,7 @@ export default function Home() {
       form.append("course_name", item.courseName);
       form.append("unit_number", item.unitNumber);
       form.append("chapter_number", item.chapterNumber);
+      form.append("awarding_body", item.awardingBody);
       form.append("video", item.file);
       try {
         const res = await fetch(`${API_URL}/jobs`, { method: "POST", body: form });
@@ -181,18 +186,34 @@ export default function Home() {
 
       <section style={{ marginBottom: 32 }}>
         <label style={fieldLabel}>
-          Course name (applied to new videos you add below)
+          Awarding body (applied to new videos you add below)
           <input
             style={inputStyle}
-            value={courseName}
+            value={awardingBody}
             onChange={(e) => {
               const value = e.target.value;
-              setCourseName(value);
-              setStaged((prev) => prev.map((item) => ({ ...item, courseName: value })));
+              setAwardingBody(value);
+              setStaged((prev) => prev.map((item) => ({ ...item, awardingBody: value })));
             }}
-            placeholder="e.g. Intro to Biology"
+            placeholder="e.g. Pearson"
           />
         </label>
+
+        <div style={{ marginTop: 16 }}>
+          <label style={fieldLabel}>
+            Course name (applied to new videos you add below)
+            <input
+              style={inputStyle}
+              value={courseName}
+              onChange={(e) => {
+                const value = e.target.value;
+                setCourseName(value);
+                setStaged((prev) => prev.map((item) => ({ ...item, courseName: value })));
+              }}
+              placeholder="e.g. Intro to Biology"
+            />
+          </label>
+        </div>
 
         <div style={{ marginTop: 16 }}>
           <input
@@ -289,13 +310,16 @@ export default function Home() {
 
 function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
+  const [viewing, setViewing] = useState(false);
   const badge = statusBadge(job.status);
+  const fileUrl = `${API_URL}/jobs/${job.job_id}/file`;
 
   return (
     <div style={{ background: "#0d3b54", borderRadius: 10, padding: 14 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 600, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {job.awarding_body ? `${job.awarding_body} — ` : ""}
             {job.course_name} — {job.unit_number}
             {job.chapter_number ? ` — ${job.chapter_number}` : ""}
           </div>
@@ -351,39 +375,63 @@ function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: stri
       )}
 
       {job.status === "done" && job.result_filename && (
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-          <a
-            href={`${API_URL}/jobs/${job.job_id}/file`}
-            style={{ ...buttonStyle(false), display: "inline-block", textDecoration: "none", padding: "8px 16px", fontSize: 13 }}
-          >
-            ⬇ Download
-          </a>
-
-          {job.drive_status === "saved" ? (
-            <a
-              href={job.drive_link || "#"}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: "#8fe8b0", fontSize: 13, textDecoration: "none" }}
-            >
-              ✅ Saved to Google Drive — open folder
-            </a>
-          ) : (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
             <button
-              onClick={() => onSaveToDrive(job.job_id)}
-              disabled={job.drive_status === "saving"}
+              onClick={() => setViewing((v) => !v)}
               style={{
-                ...buttonStyle(job.drive_status === "saving"),
-                background: job.drive_status === "saving" ? "#3a6a76" : "#4285F4",
-                color: "#fff",
+                ...buttonStyle(false),
+                background: viewing ? "#3a6a76" : "#60ccbe",
                 padding: "8px 16px",
                 fontSize: 13,
               }}
             >
-              {job.drive_status === "saving" ? "Saving to Drive…" : "📁 Save to Google Drive"}
+              {viewing ? "✕ Hide preview" : "👁 View"}
             </button>
+
+            <a
+              href={fileUrl}
+              style={{ ...buttonStyle(false), display: "inline-block", textDecoration: "none", padding: "8px 16px", fontSize: 13 }}
+            >
+              ⬇ Download
+            </a>
+
+            {job.drive_status === "saved" ? (
+              <a
+                href={job.drive_link || "#"}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "#8fe8b0", fontSize: 13, textDecoration: "none" }}
+              >
+                ✅ Saved to Google Drive — open folder
+              </a>
+            ) : (
+              <button
+                onClick={() => onSaveToDrive(job.job_id)}
+                disabled={job.drive_status === "saving"}
+                style={{
+                  ...buttonStyle(job.drive_status === "saving"),
+                  background: job.drive_status === "saving" ? "#3a6a76" : "#4285F4",
+                  color: "#fff",
+                  padding: "8px 16px",
+                  fontSize: 13,
+                }}
+              >
+                {job.drive_status === "saving" ? "Saving to Drive…" : "📁 Save to Google Drive"}
+              </button>
+            )}
+          </div>
+
+          {viewing && (
+            <video
+              key={job.job_id}
+              controls
+              autoPlay
+              src={fileUrl}
+              style={{ width: "100%", marginTop: 12, borderRadius: 8, background: "#000" }}
+            />
           )}
-        </div>
+        </>
       )}
 
       {job.drive_status === "failed" && job.drive_error && (
