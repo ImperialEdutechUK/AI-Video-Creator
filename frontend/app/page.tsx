@@ -34,6 +34,8 @@ interface StagedItem {
   courseName: string;
   unitNumber: string;
   chapterNumber: string;
+  uploadPct: number | null; // null = not uploading yet
+  uploadError: string | null;
 }
 
 export default function Home() {
@@ -43,6 +45,7 @@ export default function Home() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -77,6 +80,8 @@ export default function Home() {
       courseName,
       unitNumber: `Unit ${startUnit + i}`,
       chapterNumber: "",
+      uploadPct: null,
+      uploadError: null,
     }));
     setStaged((prev) => [...prev, ...additions]);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -88,6 +93,52 @@ export default function Home() {
 
   function removeStaged(key: string) {
     setStaged((prev) => prev.filter((s) => s.key !== key));
+  }
+
+  // Uploads a single staged item via XHR (instead of fetch) so we get real
+  // upload-progress events — "adding to queue" is really a full video
+  // upload to the backend, and for a large file that transfer time is the
+  // actual bottleneck, not server logic. Showing live % makes that visible
+  // instead of leaving the button on an unexplained "Queuing…".
+  function uploadOne(item: StagedItem): Promise<void> {
+    return new Promise((resolve) => {
+      const form = new FormData();
+      form.append("course_name", item.courseName);
+      form.append("unit_number", item.unitNumber);
+      form.append("chapter_number", item.chapterNumber);
+      form.append("awarding_body", item.awardingBody);
+      form.append("video", item.file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_URL}/jobs`);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          updateStaged(item.key, { uploadPct: Math.round((e.loaded / e.total) * 100) });
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setStaged((prev) => prev.filter((s) => s.key !== item.key));
+          fetchJobs();
+        } else {
+          updateStaged(item.key, {
+            uploadPct: null,
+            uploadError: xhr.responseText || `Upload failed (${xhr.status})`,
+          });
+        }
+        resolve();
+      };
+
+      xhr.onerror = () => {
+        updateStaged(item.key, { uploadPct: null, uploadError: "Network error during upload" });
+        resolve();
+      };
+
+      updateStaged(item.key, { uploadPct: 0, uploadError: null });
+      xhr.send(form);
+    });
   }
 
   async function submitQueue() {
@@ -104,51 +155,19 @@ export default function Home() {
     // Upload a few files at once instead of one-at-a-time: waiting for
     // each full video body to finish uploading before starting the next
     // was the main reason "adding to queue" felt slow with more than one
-    // file staged — the button sat on "Queuing…" for the sum of every
-    // upload's time instead of the slowest one. As each upload finishes
-    // it's removed from the staged list and the queue view refreshes
-    // immediately, so items show up as "queued" as soon as they land
-    // instead of only after the whole batch completes.
+    // file staged.
     const CONCURRENCY = 3;
-    const queueErrors: string[] = [];
+    const pending = [...staged];
     let cursor = 0;
-
-    async function uploadOne(item: StagedItem) {
-      const form = new FormData();
-      form.append("course_name", item.courseName);
-      form.append("unit_number", item.unitNumber);
-      form.append("chapter_number", item.chapterNumber);
-      form.append("awarding_body", item.awardingBody);
-      form.append("video", item.file);
-      try {
-        const res = await fetch(`${API_URL}/jobs`, { method: "POST", body: form });
-        if (!res.ok) {
-          const detail = await res.text();
-          throw new Error(`${item.file.name}: ${detail || res.status}`);
-        }
-        setStaged((prev) => prev.filter((s) => s.key !== item.key));
-        fetchJobs();
-      } catch (err: any) {
-        queueErrors.push(err.message || `${item.file.name}: failed to queue`);
-      }
-    }
-
     async function worker() {
-      while (cursor < staged.length) {
-        const item = staged[cursor];
+      while (cursor < pending.length) {
+        const item = pending[cursor];
         cursor += 1;
         await uploadOne(item);
       }
     }
-
-    try {
-      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, staged.length) }, worker));
-      if (queueErrors.length > 0) {
-        setError(queueErrors.join("; "));
-      }
-    } finally {
-      setSubmitting(false);
-    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, worker));
+    setSubmitting(false);
   }
 
   async function saveToDrive(jobId: string) {
@@ -174,198 +193,319 @@ export default function Home() {
     }
   }
 
-  const activeCount = jobs.filter((j) => j.status === "queued" || j.status === "processing").length;
+  const queuedCount = jobs.filter((j) => j.status === "queued").length;
+  const processingCount = jobs.filter((j) => j.status === "processing").length;
+  const doneCount = jobs.filter((j) => j.status === "done").length;
+  const failedCount = jobs.filter((j) => j.status === "failed").length;
 
   return (
-    <main style={{ maxWidth: 760, margin: "0 auto", padding: "48px 24px" }}>
-      <h1 style={{ fontSize: 28, marginBottom: 4 }}>🎬 SLC Video Merger</h1>
-      <p style={{ color: "#9fc4d4", marginTop: 0, marginBottom: 32 }}>
-        Queue up several NotebookLM exports at once — they process one at a
-        time in the background so nothing slows down from contention.
-      </p>
-
-      <section style={{ marginBottom: 32 }}>
-        <label style={fieldLabel}>
-          Awarding body (applied to new videos you add below)
-          <input
-            style={inputStyle}
-            value={awardingBody}
-            onChange={(e) => {
-              const value = e.target.value;
-              setAwardingBody(value);
-              setStaged((prev) => prev.map((item) => ({ ...item, awardingBody: value })));
-            }}
-            placeholder="e.g. Pearson"
-          />
-        </label>
-
-        <div style={{ marginTop: 16 }}>
-          <label style={fieldLabel}>
-            Course name (applied to new videos you add below)
-            <input
-              style={inputStyle}
-              value={courseName}
-              onChange={(e) => {
-                const value = e.target.value;
-                setCourseName(value);
-                setStaged((prev) => prev.map((item) => ({ ...item, courseName: value })));
-              }}
-              placeholder="e.g. Intro to Biology"
-            />
-          </label>
+    <main>
+      <header
+        style={{
+          borderBottom: "1px solid var(--border)",
+          background: "rgba(10, 30, 43, 0.85)",
+          backdropFilter: "blur(8px)",
+          position: "sticky",
+          top: 0,
+          zIndex: 10,
+        }}
+      >
+        <div className="container" style={{ paddingTop: 22, paddingBottom: 22 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 14 }}>
+            <div>
+              <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0, letterSpacing: "-0.01em" }}>
+                SLC Video Merger
+              </h1>
+              <p style={{ color: "var(--text-secondary)", margin: "4px 0 0", fontSize: 14 }}>
+                Turn NotebookLM exports into branded, watermark-free lesson videos.
+              </p>
+            </div>
+            <div className="header-stats">
+              <StatPill label="Queued" value={queuedCount} tone="queued" />
+              <StatPill label="Processing" value={processingCount} tone="processing" />
+              <StatPill label="Done" value={doneCount} tone="success" />
+              {failedCount > 0 && <StatPill label="Failed" value={failedCount} tone="danger" />}
+            </div>
+          </div>
         </div>
+      </header>
 
-        <div style={{ marginTop: 16 }}>
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/x-msvideo"
-            onChange={(e) => handleFilesPicked(e.target.files)}
-          />
-        </div>
+      <div className="container" style={{ paddingTop: 28 }}>
+        <div className="layout-grid">
+          {/* ── Upload panel ───────────────────────────────────────── */}
+          <section className="card upload-panel" style={{ padding: 20 }}>
+            <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 16px" }}>Add videos</h2>
 
-        {staged.length > 0 && (
-          <div style={{ marginTop: 20, display: "grid", gap: 10 }}>
-            {staged.map((item) => (
-              <div
-                key={item.key}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 120px 120px 32px",
-                  gap: 8,
-                  alignItems: "center",
-                  background: "#0d3b54",
-                  borderRadius: 8,
-                  padding: "8px 10px",
+            <Field label="Awarding body">
+              <input
+                className="field-input"
+                value={awardingBody}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setAwardingBody(value);
+                  setStaged((prev) => prev.map((item) => ({ ...item, awardingBody: value })));
                 }}
-              >
-                <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  📄 {item.file.name}
-                </div>
+                placeholder="e.g. Pearson"
+              />
+            </Field>
+
+            <div style={{ marginTop: 14 }}>
+              <Field label="Course name">
                 <input
-                  style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
-                  value={item.unitNumber.replace("Unit ", "")}
-                  onChange={(e) => updateStaged(item.key, { unitNumber: `Unit ${e.target.value.replace(/\D/g, "")}` })}
-                  placeholder="1"
-                />
-                <input
-                  style={{ ...inputStyle, padding: "6px 8px", fontSize: 13 }}
-                  value={item.chapterNumber.replace("Chapter ", "")}
-                  onChange={(e) => updateStaged(item.key, { chapterNumber: `Chapter ${e.target.value.replace(/\D/g, "")}` })}
-                  placeholder="1"
-                />
-                <div style={{ gridColumn: "1 / span 3", fontSize: 12, color: "#9fc4d4" }}>
-                  {item.unitNumber || "Unit ?"} | {item.chapterNumber || "Chapter ?"}
-                </div>
-                <button
-                  onClick={() => removeStaged(item.key)}
-                  title="Remove"
-                  style={{
-                    background: "transparent",
-                    border: "none",
-                    color: "#ff8a8a",
-                    cursor: "pointer",
-                    fontSize: 16,
+                  className="field-input"
+                  value={courseName}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setCourseName(value);
+                    setStaged((prev) => prev.map((item) => ({ ...item, courseName: value })));
                   }}
-                >
-                  ✕
+                  placeholder="e.g. Intro to Biology"
+                />
+              </Field>
+            </div>
+
+            <div
+              className={`dropzone${dragging ? " dragging" : ""}`}
+              style={{ marginTop: 16 }}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragging(false);
+                handleFilesPicked(e.dataTransfer.files);
+              }}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/x-msvideo"
+                onChange={(e) => handleFilesPicked(e.target.files)}
+                style={{ display: "none" }}
+              />
+              <div style={{ fontSize: 14, color: "var(--text)", fontWeight: 500 }}>
+                Drop video files here, or click to browse
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4 }}>
+                MP4, MOV, WebM, MKV, AVI
+              </div>
+            </div>
+
+            {staged.length > 0 && (
+              <div style={{ marginTop: 18, display: "grid", gap: 8 }}>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 600 }}>
+                  {staged.length} staged
+                </div>
+                {staged.map((item) => (
+                  <StagedRow key={item.key} item={item} onUpdate={updateStaged} onRemove={removeStaged} />
+                ))}
+
+                <button onClick={submitQueue} disabled={submitting} className="btn btn-primary" style={{ marginTop: 4, width: "100%" }}>
+                  {submitting
+                    ? "Uploading…"
+                    : `Add ${staged.length} video${staged.length > 1 ? "s" : ""} to queue`}
                 </button>
               </div>
-            ))}
+            )}
 
-            <button
-              onClick={submitQueue}
-              disabled={submitting}
-              style={{ ...buttonStyle(submitting), marginTop: 8, justifySelf: "start" }}
-            >
-              {submitting
-                ? "Queuing…"
-                : `Add ${staged.length} video${staged.length > 1 ? "s" : ""} to queue`}
-            </button>
-          </div>
-        )}
+            {error && (
+              <div className="fade-in" style={{ color: "var(--danger)", fontSize: 13, marginTop: 12 }}>
+                {error}
+              </div>
+            )}
+          </section>
 
-        {error && <p style={{ color: "#ff8a8a", marginTop: 12 }}>⚠️ {error}</p>}
-      </section>
+          {/* ── Queue panel ────────────────────────────────────────── */}
+          <section>
+            <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 14px" }}>Queue</h2>
 
-      <section>
-        <h2 style={{ fontSize: 18, marginBottom: 12 }}>
-          Queue {activeCount > 0 && <span style={{ color: "#60ccbe" }}>({activeCount} active)</span>}
-        </h2>
+            {jobs.length === 0 && (
+              <div className="card" style={{ padding: 32, textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
+                Nothing queued yet — add a video to get started.
+              </div>
+            )}
 
-        {jobs.length === 0 && (
-          <p style={{ color: "#6f97a6" }}>Nothing queued yet — add a video above.</p>
-        )}
-
-        <div style={{ display: "grid", gap: 12 }}>
-          {jobs.map((job) => (
-            <JobCard key={job.job_id} job={job} onSaveToDrive={saveToDrive} />
-          ))}
+            <div style={{ display: "grid", gap: 10 }}>
+              {jobs.map((job) => (
+                <JobCard key={job.job_id} job={job} onSaveToDrive={saveToDrive} />
+              ))}
+            </div>
+          </section>
         </div>
-      </section>
+      </div>
     </main>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 13, color: "var(--text-secondary)", fontWeight: 500 }}>
+      {label}
+      {children}
+    </label>
+  );
+}
+
+function StagedRow({
+  item,
+  onUpdate,
+  onRemove,
+}: {
+  item: StagedItem;
+  onUpdate: (key: string, patch: Partial<StagedItem>) => void;
+  onRemove: (key: string) => void;
+}) {
+  const isUploading = item.uploadPct !== null;
+  return (
+    <div
+      style={{
+        background: "var(--surface-raised)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-sm)",
+        padding: "10px 10px",
+      }}
+    >
+      <div className="staged-row">
+        <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-secondary)" }}>
+          {item.file.name}
+        </div>
+        <input
+          className="field-input"
+          style={{ padding: "6px 8px", fontSize: 13 }}
+          value={item.unitNumber.replace("Unit ", "")}
+          onChange={(e) => onUpdate(item.key, { unitNumber: `Unit ${e.target.value.replace(/\D/g, "")}` })}
+          placeholder="Unit #"
+          disabled={isUploading}
+        />
+        <input
+          className="field-input"
+          style={{ padding: "6px 8px", fontSize: 13 }}
+          value={item.chapterNumber.replace("Chapter ", "")}
+          onChange={(e) => onUpdate(item.key, { chapterNumber: `Chapter ${e.target.value.replace(/\D/g, "")}` })}
+          placeholder="Ch. #"
+          disabled={isUploading}
+        />
+        <button
+          onClick={() => onRemove(item.key)}
+          disabled={isUploading}
+          className="icon-btn"
+          title="Remove"
+          aria-label="Remove"
+        >
+          ✕
+        </button>
+      </div>
+
+      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 6 }}>
+        {item.unitNumber || "Unit ?"} · {item.chapterNumber || "Chapter ?"}
+      </div>
+
+      {isUploading && (
+        <div style={{ marginTop: 8 }}>
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${item.uploadPct}%` }} />
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
+            Uploading… {item.uploadPct}%
+          </div>
+        </div>
+      )}
+
+      {item.uploadError && (
+        <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 6 }}>{item.uploadError}</div>
+      )}
+    </div>
+  );
+}
+
+function StatPill({ label, value, tone }: { label: string; value: number; tone: "queued" | "processing" | "success" | "danger" }) {
+  const colors: Record<string, { fg: string; bg: string }> = {
+    queued: { fg: "var(--queued)", bg: "var(--queued-soft)" },
+    processing: { fg: "var(--accent)", bg: "var(--accent-soft)" },
+    success: { fg: "var(--success)", bg: "var(--success-soft)" },
+    danger: { fg: "var(--danger)", bg: "var(--danger-soft)" },
+  };
+  const c = colors[tone];
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 7,
+        padding: "6px 12px",
+        borderRadius: 999,
+        background: c.bg,
+        color: c.fg,
+        fontSize: 12.5,
+        fontWeight: 600,
+      }}
+    >
+      {tone === "processing" && value > 0 && <span className="status-dot pulse" />}
+      {value} {label}
+    </div>
   );
 }
 
 function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
   const [viewing, setViewing] = useState(false);
-  const badge = statusBadge(job.status);
   const fileUrl = `${API_URL}/jobs/${job.job_id}/file`;
+  const accent = statusAccent(job.status);
 
   return (
-    <div style={{ background: "#0d3b54", borderRadius: 10, padding: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+    <div className="card fade-in" style={{ padding: 16, borderLeft: `3px solid ${accent}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
         <div style={{ minWidth: 0 }}>
-          <div style={{ fontWeight: 600, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {job.awarding_body ? `${job.awarding_body} — ` : ""}
-            {job.course_name} — {job.unit_number}
-            {job.chapter_number ? ` — ${job.chapter_number}` : ""}
+          <div style={{ fontWeight: 600, fontSize: 14.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {job.awarding_body ? `${job.awarding_body} · ` : ""}
+            {job.course_name} · {job.unit_number}
+            {job.chapter_number ? ` · ${job.chapter_number}` : ""}
           </div>
-          <div style={{ fontSize: 12, color: "#7fa9b8" }}>{job.original_filename}</div>
+          <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 2 }}>{job.original_filename}</div>
         </div>
-        <span
-          style={{
-            ...badge,
-            padding: "4px 10px",
-            borderRadius: 999,
-            fontSize: 12,
-            fontWeight: 600,
-            whiteSpace: "nowrap",
-          }}
-        >
-          {job.status}
-        </span>
+        <StatusPill status={job.status} />
       </div>
 
-      {job.status === "processing" && job.progress.length > 0 && (
-        <div style={{ fontSize: 12, color: "#9fc4d4", marginTop: 8 }}>
-          {job.progress[job.progress.length - 1]}
+      {job.status === "processing" && (
+        <div style={{ marginTop: 12 }}>
+          <div className="progress-track">
+            <div className="progress-fill indeterminate" />
+          </div>
+          {job.progress.length > 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 6 }}>
+              {job.progress[job.progress.length - 1]}
+            </div>
+          )}
         </div>
       )}
 
-      {job.error && <div style={{ color: "#ff8a8a", fontSize: 13, marginTop: 8 }}>⚠️ {job.error}</div>}
+      {job.error && (
+        <div style={{ color: "var(--danger)", fontSize: 13, marginTop: 10, background: "var(--danger-soft)", padding: "8px 10px", borderRadius: "var(--radius-sm)" }}>
+          {job.error}
+        </div>
+      )}
 
       {job.progress.length > 0 && (
-        <button
-          onClick={() => setExpanded((v) => !v)}
-          style={{ background: "none", border: "none", color: "#60ccbe", fontSize: 12, cursor: "pointer", padding: 0, marginTop: 8 }}
-        >
+        <button onClick={() => setExpanded((v) => !v)} className="btn btn-ghost" style={{ marginTop: 8, fontSize: 12 }}>
           {expanded ? "Hide log" : "Show log"}
         </button>
       )}
       {expanded && (
         <div
+          className="log-view fade-in"
           style={{
-            marginTop: 8,
-            background: "#062a30",
-            borderRadius: 6,
+            marginTop: 6,
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius-sm)",
             padding: 10,
-            fontFamily: "monospace",
-            fontSize: 12,
             maxHeight: 160,
             overflowY: "auto",
+            color: "var(--text-secondary)",
           }}
         >
           {job.progress.map((line, i) => (
@@ -376,48 +516,22 @@ function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: stri
 
       {job.status === "done" && job.result_filename && (
         <>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-            <button
-              onClick={() => setViewing((v) => !v)}
-              style={{
-                ...buttonStyle(false),
-                background: viewing ? "#3a6a76" : "#60ccbe",
-                padding: "8px 16px",
-                fontSize: 13,
-              }}
-            >
-              {viewing ? "✕ Hide preview" : "👁 View"}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+            <button onClick={() => setViewing((v) => !v)} className={viewing ? "btn btn-secondary" : "btn btn-primary"}>
+              {viewing ? "Hide preview" : "View"}
             </button>
 
-            <a
-              href={fileUrl}
-              style={{ ...buttonStyle(false), display: "inline-block", textDecoration: "none", padding: "8px 16px", fontSize: 13 }}
-            >
-              ⬇ Download
+            <a href={fileUrl} className="btn btn-secondary">
+              Download
             </a>
 
             {job.drive_status === "saved" ? (
-              <a
-                href={job.drive_link || "#"}
-                target="_blank"
-                rel="noreferrer"
-                style={{ color: "#8fe8b0", fontSize: 13, textDecoration: "none" }}
-              >
-                ✅ Saved to Google Drive — open folder
+              <a href={job.drive_link || "#"} target="_blank" rel="noreferrer" style={{ color: "var(--success)", fontSize: 13, fontWeight: 600, textDecoration: "none", marginLeft: 2 }}>
+                ✓ Saved to Drive — open folder
               </a>
             ) : (
-              <button
-                onClick={() => onSaveToDrive(job.job_id)}
-                disabled={job.drive_status === "saving"}
-                style={{
-                  ...buttonStyle(job.drive_status === "saving"),
-                  background: job.drive_status === "saving" ? "#3a6a76" : "#4285F4",
-                  color: "#fff",
-                  padding: "8px 16px",
-                  fontSize: 13,
-                }}
-              >
-                {job.drive_status === "saving" ? "Saving to Drive…" : "📁 Save to Google Drive"}
+              <button onClick={() => onSaveToDrive(job.job_id)} disabled={job.drive_status === "saving"} className="btn btn-drive">
+                {job.drive_status === "saving" ? "Saving to Drive…" : "Save to Google Drive"}
               </button>
             )}
           </div>
@@ -428,60 +542,44 @@ function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: stri
               controls
               autoPlay
               src={fileUrl}
-              style={{ width: "100%", marginTop: 12, borderRadius: 8, background: "#000" }}
+              style={{ width: "100%", marginTop: 12, borderRadius: "var(--radius-md)", background: "#000", display: "block" }}
             />
           )}
         </>
       )}
 
       {job.drive_status === "failed" && job.drive_error && (
-        <div style={{ color: "#ff8a8a", fontSize: 12, marginTop: 6 }}>
-          ⚠️ Drive save failed: {job.drive_error}
-        </div>
+        <div style={{ color: "var(--danger)", fontSize: 12.5, marginTop: 8 }}>Drive save failed: {job.drive_error}</div>
       )}
     </div>
   );
 }
 
-function statusBadge(status: JobStatus): React.CSSProperties {
+function statusAccent(status: JobStatus): string {
   switch (status) {
     case "queued":
-      return { background: "#3a4a56", color: "#cfe8f0" };
+      return "var(--queued)";
     case "processing":
-      return { background: "#2a5a6e", color: "#8fe8d8" };
+      return "var(--accent)";
     case "done":
-      return { background: "#1f5c3a", color: "#8fe8b0" };
+      return "var(--success)";
     case "failed":
-      return { background: "#5c2323", color: "#ff8a8a" };
+      return "var(--danger)";
   }
 }
 
-const fieldLabel: React.CSSProperties = {
-  display: "flex",
-  flexDirection: "column",
-  fontSize: 14,
-  color: "#cfe8f0",
-  gap: 4,
-};
-
-const inputStyle: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 8,
-  border: "1px solid #1c5670",
-  background: "#08303f",
-  color: "#fff",
-  fontSize: 15,
-};
-
-function buttonStyle(disabled: boolean): React.CSSProperties {
-  return {
-    padding: "12px 20px",
-    borderRadius: 8,
-    border: "none",
-    background: disabled ? "#3a6a76" : "#60ccbe",
-    color: "#062a30",
-    fontWeight: 600,
-    fontSize: 15,
-    cursor: disabled ? "not-allowed" : "pointer",
+function StatusPill({ status }: { status: JobStatus }) {
+  const map: Record<JobStatus, { label: string; fg: string; bg: string; pulse?: boolean }> = {
+    queued: { label: "Queued", fg: "var(--queued)", bg: "var(--queued-soft)" },
+    processing: { label: "Processing", fg: "var(--accent)", bg: "var(--accent-soft)", pulse: true },
+    done: { label: "Done", fg: "var(--success)", bg: "var(--success-soft)" },
+    failed: { label: "Failed", fg: "var(--danger)", bg: "var(--danger-soft)" },
   };
+  const s = map[status];
+  return (
+    <span className="status-pill" style={{ background: s.bg, color: s.fg }}>
+      <span className={`status-dot${s.pulse ? " pulse" : ""}`} />
+      {s.label}
+    </span>
+  );
 }
