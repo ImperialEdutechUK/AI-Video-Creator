@@ -1389,7 +1389,7 @@ def ensure_assets():
 
 
 def process_video(course_name: str, unit_number: str, video_bytes: bytes,
-                   tmp: Path, progress_cb=None) -> tuple[bytes, str]:
+                   tmp: Path, progress_cb=None, chapter_number: str = "") -> tuple[bytes, str]:
     """Run the full merge pipeline on raw video bytes. Returns
     (output_bytes, output_filename). This is the same sequence the
     original Streamlit queue used: normalise -> intro/outro -> remove
@@ -1400,6 +1400,7 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
 
     course_name = _clean_text_field(course_name)
     unit_number = _clean_text_field(unit_number, max_len=40)
+    chapter_number = _clean_text_field(chapter_number, max_len=40)
 
     raw = tmp / "raw.mp4"
     raw.write_bytes(video_bytes)
@@ -1414,10 +1415,18 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
         except Exception as e:
             errors[name] = e
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(_job, "norm", normalise, raw, tmp / "norm.mp4")
-        _job("intro", make_intro, course_name, unit_number, "", tmp)
-        _job("outro", make_outro, tmp)
+    # All three of these are independent of each other, so they run as
+    # three concurrent tasks instead of "norm in the background while
+    # intro+outro block the main thread one after another" — that serial
+    # intro/outro build was needless extra wall-clock time per job.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_job, "norm", normalise, raw, tmp / "norm.mp4"),
+            pool.submit(_job, "intro", make_intro, course_name, unit_number, chapter_number, tmp),
+            pool.submit(_job, "outro", make_outro, tmp),
+        ]
+        for f in futures:
+            f.result()
 
     if errors:
         raise RuntimeError("; ".join(f"{k}: {v}" for k, v in errors.items()))
@@ -1435,7 +1444,10 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     final = concat([with_trans, results["outro"]], tmp / "final.mp4", tmp)
 
     data = final.read_bytes()
-    fn = _safe_filename(f"SLC_Video_{course_name[:30]}_{unit_number}.mp4")
+    name_parts = [course_name[:30], unit_number]
+    if chapter_number:
+        name_parts.append(chapter_number)
+    fn = _safe_filename("SLC_Video_" + "_".join(name_parts) + ".mp4")
     return data, fn
 
 

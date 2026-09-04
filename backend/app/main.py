@@ -55,7 +55,11 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 # How many videos process at once. Video encoding is CPU-bound, so this
 # should roughly match the number of CPU cores your Railway plan gives you
 # — set higher than that and jobs slow each other down instead of speeding
-# up. Default 1 is the safe choice for Railway's smaller plans.
+# up. Default 1 is the safe choice for Railway's smaller plans, but it also
+# means every queued video processes strictly one-at-a-time no matter how
+# many CPUs the plan actually has — if jobs are backing up in "queued" and
+# your Railway plan has more than 1 vCPU, raise WORKERS (e.g. to 2 or 3) in
+# the service's environment variables to process that many videos at once.
 WORKERS = max(1, int(os.environ.get("WORKERS", "1")))
 
 # job_id -> {status, progress, error, result_path, result_filename,
@@ -82,8 +86,9 @@ def _run_job(job_id: str):
     with JOBS_LOCK:
         job = JOBS[job_id]
         job["status"] = "processing"
-        course_name, unit_number, video_bytes = (
-            job["course_name"], job["unit_number"], job.pop("_video_bytes"),
+        course_name, unit_number, chapter_number, video_bytes = (
+            job["course_name"], job["unit_number"], job.get("chapter_number", ""),
+            job.pop("_video_bytes"),
         )
 
     def progress_cb(msg: str):
@@ -96,7 +101,8 @@ def _run_job(job_id: str):
 
     try:
         data, filename = pipeline.process_video(
-            course_name, unit_number, video_bytes, scratch, progress_cb=progress_cb
+            course_name, unit_number, video_bytes, scratch, progress_cb=progress_cb,
+            chapter_number=chapter_number,
         )
         out_path = job_dir / filename
         out_path.write_bytes(data)

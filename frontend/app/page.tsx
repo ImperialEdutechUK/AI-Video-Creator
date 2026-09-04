@@ -97,26 +97,50 @@ export default function Home() {
     }
 
     setSubmitting(true);
-    try {
-      // Fire uploads sequentially — the backend queues processing anyway,
-      // but sequential uploads avoid saturating upload bandwidth on large
-      // files all at once.
-      for (const item of staged) {
-        const form = new FormData();
-        form.append("course_name", item.courseName);
-        form.append("unit_number", item.unitNumber);
-        form.append("chapter_number", item.chapterNumber);
-        form.append("video", item.file);
+    // Upload a few files at once instead of one-at-a-time: waiting for
+    // each full video body to finish uploading before starting the next
+    // was the main reason "adding to queue" felt slow with more than one
+    // file staged — the button sat on "Queuing…" for the sum of every
+    // upload's time instead of the slowest one. As each upload finishes
+    // it's removed from the staged list and the queue view refreshes
+    // immediately, so items show up as "queued" as soon as they land
+    // instead of only after the whole batch completes.
+    const CONCURRENCY = 3;
+    const queueErrors: string[] = [];
+    let cursor = 0;
+
+    async function uploadOne(item: StagedItem) {
+      const form = new FormData();
+      form.append("course_name", item.courseName);
+      form.append("unit_number", item.unitNumber);
+      form.append("chapter_number", item.chapterNumber);
+      form.append("video", item.file);
+      try {
         const res = await fetch(`${API_URL}/jobs`, { method: "POST", body: form });
         if (!res.ok) {
           const detail = await res.text();
           throw new Error(`${item.file.name}: ${detail || res.status}`);
         }
+        setStaged((prev) => prev.filter((s) => s.key !== item.key));
+        fetchJobs();
+      } catch (err: any) {
+        queueErrors.push(err.message || `${item.file.name}: failed to queue`);
       }
-      setStaged([]);
-      fetchJobs();
-    } catch (err: any) {
-      setError(err.message || "Failed to queue one or more videos.");
+    }
+
+    async function worker() {
+      while (cursor < staged.length) {
+        const item = staged[cursor];
+        cursor += 1;
+        await uploadOne(item);
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, staged.length) }, worker));
+      if (queueErrors.length > 0) {
+        setError(queueErrors.join("; "));
+      }
     } finally {
       setSubmitting(false);
     }
