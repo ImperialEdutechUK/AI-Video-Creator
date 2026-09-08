@@ -893,25 +893,44 @@ def _track_gemini_notebook_end(path, match, progress_cb=None, max_scan=60.0):
     except Exception:
         return None
 
-    fw0, fh0 = match["frame_size"]
-    mw, mh = match["template_size"]
-    # Resize the source template to the exact size that produced the best hit.
-    rt = cv2.resize(tmpl, (mw, mh), interpolation=cv2.INTER_CUBIC)
-
+    match_time = max(0.0, match.get("time", 0.0))
     bx, by, bw, bh = match["box"]
+
+    # "frame_size" is only populated by the template-matching detector
+    # (_find_gemini_notebook_wordmark). The OCR-based detector
+    # (_find_gemini_notebook_ocr_box) returns a lighter dict with just
+    # "box"/"time", so fall back to probing a real frame for the native
+    # extraction resolution when it's missing.
+    frame_size = match.get("frame_size")
+    if frame_size is None:
+        probe_frame = _grab_cv_gray_frame(path, match_time)
+        if probe_frame is None:
+            return None
+        fh0, fw0 = probe_frame.shape[:2]
+    else:
+        fw0, fh0 = frame_size
+
     # Convert the 1920x1080 match back to the extraction frame coordinate space.
-    x = int(bx * fw0 / 1920.0)
-    y = int(by * fh0 / 1080.0)
     w = max(1, int(bw * fw0 / 1920.0))
     h = max(1, int(bh * fh0 / 1080.0))
 
+    # "template_size" is likewise only set by the template-matching detector
+    # (the exact scale that produced its best hit). Without it, resize the
+    # template to the detected box's native-pixel size instead.
+    mw, mh = match.get("template_size", (w, h))
+    # Resize the source template to the exact size that produced the best hit.
+    rt = cv2.resize(tmpl, (max(1, mw), max(1, mh)), interpolation=cv2.INTER_CUBIC)
+
     step = 0.40
-    t = max(0.0, match["time"])
+    t = match_time
     scan_end = min(max_scan, total)
     last_present = t
     absent_run = 0
     seen = False
-    threshold = max(0.34, min(0.48, match["confidence"] * 0.58))
+    # "confidence" is only set by the template-matching detector; the OCR
+    # detector doesn't produce a comparable score, so use a sane default.
+    confidence = match.get("confidence", 0.75)
+    threshold = max(0.34, min(0.48, confidence * 0.58))
 
     while t <= scan_end:
         frame = _grab_cv_gray_frame(path, t)
