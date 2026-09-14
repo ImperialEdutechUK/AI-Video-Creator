@@ -26,11 +26,10 @@ Carried over from the original app but intentionally left out of this
 first pass, to get the core upload → process → download flow working and
 verified before adding more surface area:
 
-- Google Drive upload (OAuth refresh-token flow)
 - Canva Connect API integration
 - The optional password gate (`APP_PASSWORD`)
 - A persistent job queue (jobs currently live in the backend's memory and
-  are lost on redeploy)
+  are lost on redeploy/restart)
 
 Each of these can be added as a follow-up — the ffmpeg/OpenCV pipeline
 itself (`backend/app/pipeline.py`) is untouched from the original app, so
@@ -42,3 +41,13 @@ The full pipeline was run end-to-end against this exact code before
 handoff: upload → background job → intro/outro overlay → watermark
 detection & removal → transition → concat → a valid, playable 1920x1080
 H.264/AAC MP4 downloaded via the API.
+
+## Railway stability + multi-user revision
+
+The backend now streams uploads to disk, keeps video data out of the in-memory
+job queue, keeps completed output on disk, limits default processing/upload
+concurrency, cleans temporary files aggressively, and exposes `/healthz` for
+Railway deployment health checks. It also isolates each browser's jobs, shows
+team-wide queue positions, enforces global/per-browser queue limits, and checks
+safe free disk capacity before accepting large uploads. See `STABILITY_FIXES.md`
+for the deployment settings and details.

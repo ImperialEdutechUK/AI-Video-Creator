@@ -64,6 +64,12 @@ FOLDER_MAX_ITEMS = 50   # create a new batch folder after this many files
 MAX_UPLOAD_MB        = 500          # hard cap on any single video upload
 MAX_TEXT_FIELD_LEN   = 200          # course name / unit number length limit
 
+# Intro generation, outro generation and source normalisation can run in
+# parallel, but doing all three at once starts multiple FFmpeg-heavy tasks
+# inside a single job. Default to one preparation worker on Railway for
+# predictable CPU/RAM usage; larger plans can opt back into 2-3 via env.
+PIPELINE_PREP_WORKERS = max(1, min(3, int(os.environ.get("PIPELINE_PREP_WORKERS", "1"))))
+
 
 # ──────────────────── SECURITY HELPERS ────────────────────────────────────
 def _esc(s) -> str:
@@ -1437,13 +1443,15 @@ def ensure_assets():
         raise RuntimeError("Intro template appears corrupt.")
 
 
-def process_video(course_name: str, unit_number: str, video_bytes: bytes,
+def process_video(course_name: str, unit_number: str, input_path: str | Path,
                    tmp: Path, progress_cb=None, chapter_number: str = "",
-                   awarding_body: str = "") -> tuple[bytes, str]:
-    """Run the full merge pipeline on raw video bytes. Returns
-    (output_bytes, output_filename). This is the same sequence the
-    original Streamlit queue used: normalise -> intro/outro -> remove
-    watermark -> transition -> concat with outro."""
+                   awarding_body: str = "") -> tuple[Path, str]:
+    """Run the full merge pipeline from an on-disk source video.
+
+    Returns (final_path, output_filename). Keeping both the source and final
+    video on disk avoids creating another full-video-sized Python bytes
+    object before and after processing.
+    """
     def _p(msg):
         if progress_cb:
             progress_cb(msg)
@@ -1453,8 +1461,9 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     chapter_number = _clean_text_field(chapter_number, max_len=40)
     awarding_body = _clean_text_field(awarding_body)
 
-    raw = tmp / "raw.mp4"
-    raw.write_bytes(video_bytes)
+    raw = Path(input_path)
+    if not raw.exists() or not raw.is_file():
+        raise FileNotFoundError(f"Uploaded source video is missing: {raw}")
     src_res = _probe_resolution(str(raw))
 
     _p("1/4 Building intro, outro, normalising…")
@@ -1466,11 +1475,10 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
         except Exception as e:
             errors[name] = e
 
-    # All three of these are independent of each other, so they run as
-    # three concurrent tasks instead of "norm in the background while
-    # intro+outro block the main thread one after another" — that serial
-    # intro/outro build was needless extra wall-clock time per job.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    # These three preparation tasks are independent. On larger hosts they
+    # may run in parallel, but the Railway-safe default is one worker so a
+    # single job does not start several FFmpeg-heavy operations at once.
+    with ThreadPoolExecutor(max_workers=PIPELINE_PREP_WORKERS) as pool:
         futures = [
             pool.submit(_job, "norm", normalise, raw, tmp / "norm.mp4"),
             pool.submit(_job, "intro", make_intro, course_name, unit_number, chapter_number, awarding_body, tmp),
@@ -1482,24 +1490,35 @@ def process_video(course_name: str, unit_number: str, video_bytes: bytes,
     if errors:
         raise RuntimeError("; ".join(f"{k}: {v}" for k, v in errors.items()))
 
+    def _discard(*paths):
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
     _p(f"2/4 Replacing watermarks ({src_res[0]}x{src_res[1]})…")
     norm_clean = remove_notebooklm_watermark(
         results["norm"], tmp / "norm_clean.mp4", src_res, tmp,
         progress_cb=lambda s: _p(f"2/4 {s}"))
+    # The normalised source is no longer needed after watermark replacement.
+    _discard(results["norm"])
 
     _p("3/4 Adding transition…")
     with_trans = add_notebooklm_transition(
         results["intro"], norm_clean, tmp / "intro_and_main.mp4", tmp)
+    # Free large intermediates as soon as the next stage has consumed them.
+    _discard(results["intro"], norm_clean)
 
     _p("4/4 Merging final segments…")
     final = concat([with_trans, results["outro"]], tmp / "final.mp4", tmp)
+    _discard(with_trans, results["outro"])
 
-    data = final.read_bytes()
     name_parts = [course_name[:30], unit_number]
     if chapter_number:
         name_parts.append(chapter_number)
     fn = _safe_filename("SLC_Video_" + "_".join(name_parts) + ".mp4")
-    return data, fn
+    return final, fn
 
 
 def preview_frame(course, unit_num, chapter_number, awarding_body=""):

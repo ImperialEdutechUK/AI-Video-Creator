@@ -3,8 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 
 // Set NEXT_PUBLIC_API_URL in Vercel's project settings to your Railway
-// backend URL, e.g. https://slc-merger-backend-production.up.railway.app
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// backend URL, e.g. https://slc-merger-backend-production.up.railway.app.
+// In production we deliberately do NOT fall back to localhost: a missing
+// Vercel variable would otherwise make every user's browser try to upload
+// to their own computer and surface a misleading "network error".
+const CONFIGURED_API_URL = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/+$/, "");
+const API_URL = CONFIGURED_API_URL || (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
 
 type JobStatus = "queued" | "processing" | "done" | "failed";
 
@@ -13,6 +17,7 @@ type DriveStatus = "idle" | "saving" | "saved" | "failed";
 interface Job {
   job_id: string;
   status: JobStatus;
+  queue_position: number | null;
   progress: string[];
   error: string | null;
   result_filename: string | null;
@@ -27,6 +32,15 @@ interface Job {
   drive_link: string | null;
 }
 
+interface QueueInfo {
+  queued: number;
+  processing: number;
+  uploading: number;
+  capacity: number;
+  session_active: number;
+  session_limit: number;
+}
+
 interface StagedItem {
   key: string;
   file: File;
@@ -38,44 +52,106 @@ interface StagedItem {
   uploadError: string | null;
 }
 
+function extractApiDetail(text: string): string {
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.detail === "string") return parsed.detail;
+  } catch {
+    // Non-JSON response (for example, an edge/proxy error page).
+  }
+  return text.length <= 240 ? text : "";
+}
+
+function requestFailureMessage(status: number, responseText = ""): string {
+  const detail = extractApiDetail(responseText);
+  if (status === 413) return detail || "This video is larger than the server upload limit.";
+  if (status === 415) return detail || "Unsupported video type. Use MP4, MOV, WebM, MKV or AVI.";
+  if (status === 429) return detail || "The team queue or your browser's active-job limit has been reached. Please try again shortly.";
+  if (status === 507) return detail || "The video server is temporarily low on storage. Please try again later.";
+  if ([502, 503, 504].includes(status)) {
+    return "The video server is temporarily unavailable or restarting. Please wait a moment and retry.";
+  }
+  if (status >= 500) return detail || "The video server could not accept the upload. Please retry.";
+  return detail || `Upload failed (${status || "no response"}).`;
+}
+
+function uploadFailureMessage(xhr: XMLHttpRequest): string {
+  return requestFailureMessage(xhr.status, xhr.responseText || "");
+}
+
+const SESSION_STORAGE_KEY = "slc-video-merger-session-id";
+
+function createBrowserSessionId(): string {
+  const browserCrypto = typeof globalThis !== "undefined" ? globalThis.crypto : undefined;
+  if (browserCrypto && typeof browserCrypto.randomUUID === "function") {
+    return browserCrypto.randomUUID();
+  }
+  if (browserCrypto && typeof browserCrypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(24);
+    browserCrypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return `browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 export default function Home() {
   const [awardingBody, setAwardingBody] = useState("");
   const [courseName, setCourseName] = useState("");
   const [staged, setStaged] = useState<StagedItem[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [queueInfo, setQueueInfo] = useState<QueueInfo | null>(null);
+  const [sessionId, setSessionId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Poll the shared queue continuously — this is a team queue, not a
-  // per-session one, so everyone sees the same list and it survives reloads.
+  // Create one opaque id per browser profile and keep it across reloads.
+  // The backend uses it to isolate each staff member's jobs while still
+  // calculating queue position against the team-wide processing queue.
   useEffect(() => {
+    let id = window.localStorage.getItem(SESSION_STORAGE_KEY) || "";
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
+      id = createBrowserSessionId();
+      window.localStorage.setItem(SESSION_STORAGE_KEY, id);
+    }
+    setSessionId(id);
+  }, []);
+
+  useEffect(() => {
+    if (!sessionId) return;
     fetchJobs();
     pollRef.current = setInterval(fetchJobs, 2000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, []);
+  }, [sessionId]);
 
   const removingRef = useRef<Set<string>>(new Set());
 
   async function fetchJobs() {
+    if (!API_URL || !sessionId) return;
     try {
-      const res = await fetch(`${API_URL}/jobs`);
+      const res = await fetch(`${API_URL}/jobs`, {
+        headers: { "X-Session-Id": sessionId },
+      });
       if (!res.ok) return;
       const data = await res.json();
       const incoming: Job[] = data.jobs || [];
+      setQueueInfo(data.queue || null);
 
-      // Once a video is safely saved to Drive there's no reason to keep it
-      // cluttering the shared queue — remove it for everyone as soon as any
-      // client observes drive_status "saved". removingRef guards against
-      // firing the DELETE more than once while the backend catches up.
+      // Once this browser's video is safely saved to Drive, remove its local
+      // server copy. The ownership header means another browser cannot delete
+      // this job even if it somehow learns the job id.
       const toRemove = incoming.filter((j) => j.drive_status === "saved" && !removingRef.current.has(j.job_id));
       for (const job of toRemove) {
         removingRef.current.add(job.job_id);
-        fetch(`${API_URL}/jobs/${job.job_id}`, { method: "DELETE" }).catch(() => {
+        fetch(`${API_URL}/jobs/${job.job_id}`, {
+          method: "DELETE",
+          headers: { "X-Session-Id": sessionId },
+        }).catch(() => {
           removingRef.current.delete(job.job_id);
         });
       }
@@ -111,22 +187,72 @@ export default function Home() {
     setStaged((prev) => prev.filter((s) => s.key !== key));
   }
 
-  // Uploads a single staged item via XHR (instead of fetch) so we get real
-  // upload-progress events — "adding to queue" is really a full video
-  // upload to the backend, and for a large file that transfer time is the
-  // actual bottleneck, not server logic. Showing live % makes that visible
-  // instead of leaving the button on an unexplained "Queuing…".
-  function uploadOne(item: StagedItem): Promise<void> {
-    return new Promise((resolve) => {
-      const form = new FormData();
-      form.append("course_name", item.courseName);
-      form.append("unit_number", item.unitNumber);
-      form.append("chapter_number", item.chapterNumber);
-      form.append("awarding_body", item.awardingBody);
-      form.append("video", item.file);
+  // Reserve team queue/disk capacity before starting the large request body.
+  // This avoids making a user upload hundreds of MB only to discover that
+  // Railway has no safe queue slot or working-disk headroom left.
+  async function uploadOne(item: StagedItem): Promise<void> {
+    if (!API_URL || !sessionId) {
+      updateStaged(item.key, {
+        uploadPct: null,
+        uploadError: !API_URL
+          ? "Backend URL is not configured. Set NEXT_PUBLIC_API_URL in Vercel and redeploy."
+          : "Your browser session is still initialising. Please retry in a moment.",
+      });
+      return;
+    }
 
+    let reservationToken = "";
+    try {
+      const params = new URLSearchParams({
+        file_size: String(item.file.size),
+        filename: item.file.name,
+      });
+      const preflight = await fetch(`${API_URL}/jobs/preflight?${params.toString()}`, {
+        method: "POST",
+        headers: { "X-Session-Id": sessionId },
+      });
+      if (!preflight.ok) {
+        updateStaged(item.key, {
+          uploadPct: null,
+          uploadError: requestFailureMessage(preflight.status, await preflight.text()),
+        });
+        return;
+      }
+      const data = await preflight.json();
+      reservationToken = data.reservation_token || "";
+      if (!reservationToken) {
+        updateStaged(item.key, { uploadPct: null, uploadError: "The server did not create an upload reservation. Please retry." });
+        return;
+      }
+    } catch {
+      const message = navigator.onLine
+        ? "Could not reach the video server for upload preflight. It may be restarting or unavailable. Please retry in a moment."
+        : "Your internet connection appears to be offline. Reconnect and retry the upload.";
+      updateStaged(item.key, { uploadPct: null, uploadError: message });
+      return;
+    }
+
+    const releaseReservation = () => {
+      if (!reservationToken) return;
+      fetch(`${API_URL}/jobs/preflight/${encodeURIComponent(reservationToken)}`, {
+        method: "DELETE",
+        headers: { "X-Session-Id": sessionId },
+      }).catch(() => {});
+      reservationToken = "";
+    };
+
+    const form = new FormData();
+    form.append("course_name", item.courseName);
+    form.append("unit_number", item.unitNumber);
+    form.append("chapter_number", item.chapterNumber);
+    form.append("awarding_body", item.awardingBody);
+    form.append("video", item.file);
+
+    await new Promise<void>((resolve) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${API_URL}/jobs`);
+      xhr.setRequestHeader("X-Session-Id", sessionId);
+      xhr.setRequestHeader("X-Upload-Reservation", reservationToken);
 
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
@@ -136,19 +262,31 @@ export default function Home() {
 
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
+          reservationToken = ""; // backend consumed it successfully
           setStaged((prev) => prev.filter((s) => s.key !== item.key));
           fetchJobs();
         } else {
+          releaseReservation();
           updateStaged(item.key, {
             uploadPct: null,
-            uploadError: xhr.responseText || `Upload failed (${xhr.status})`,
+            uploadError: uploadFailureMessage(xhr),
           });
         }
         resolve();
       };
 
       xhr.onerror = () => {
-        updateStaged(item.key, { uploadPct: null, uploadError: "Network error during upload" });
+        releaseReservation();
+        const message = navigator.onLine
+          ? "Could not reach the video server. It may be restarting, unavailable, or blocked by CORS. Please retry in a moment."
+          : "Your internet connection appears to be offline. Reconnect and retry the upload.";
+        updateStaged(item.key, { uploadPct: null, uploadError: message });
+        resolve();
+      };
+
+      xhr.onabort = () => {
+        releaseReservation();
+        updateStaged(item.key, { uploadPct: null, uploadError: "Upload cancelled. You can retry when ready." });
         resolve();
       };
 
@@ -159,6 +297,14 @@ export default function Home() {
 
   async function submitQueue() {
     setError(null);
+    if (!API_URL) {
+      setError("Backend URL is not configured. Set NEXT_PUBLIC_API_URL in Vercel and redeploy the frontend.");
+      return;
+    }
+    if (!sessionId) {
+      setError("Your browser session is still initialising. Please try again in a moment.");
+      return;
+    }
     if (staged.length === 0) return;
     for (const item of staged) {
       if (!item.courseName.trim() || !item.unitNumber.trim() || !item.chapterNumber.trim()) {
@@ -168,11 +314,12 @@ export default function Home() {
     }
 
     setSubmitting(true);
-    // Upload a few files at once instead of one-at-a-time: waiting for
-    // each full video body to finish uploading before starting the next
-    // was the main reason "adding to queue" felt slow with more than one
-    // file staged.
-    const CONCURRENCY = 3;
+    // Keep browser-side upload concurrency at one by default. The backend
+    // streams uploads to disk now, but serialising transfers still avoids a
+    // burst of several large request bodies from one browser while a small
+    // Railway service is also encoding video. Multiple users can still use
+    // the app; processing itself remains governed by the backend queue.
+    const CONCURRENCY = 1;
     const pending = [...staged];
     let cursor = 0;
     async function worker() {
@@ -193,7 +340,10 @@ export default function Home() {
       prev.map((j) => (j.job_id === jobId ? { ...j, drive_status: "saving", drive_error: null } : j))
     );
     try {
-      const res = await fetch(`${API_URL}/jobs/${jobId}/drive`, { method: "POST" });
+      const res = await fetch(`${API_URL}/jobs/${jobId}/drive`, {
+        method: "POST",
+        headers: { "X-Session-Id": sessionId },
+      });
       if (!res.ok) {
         const detail = await res.text();
         throw new Error(detail || `${res.status}`);
@@ -337,17 +487,24 @@ export default function Home() {
 
           {/* ── Queue panel ────────────────────────────────────────── */}
           <section>
-            <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 14px" }}>Queue</h2>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+              <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>My queue</h2>
+              {queueInfo && (
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                  Team waiting: {queueInfo.queued}/{queueInfo.capacity} · Processing: {queueInfo.processing} · My active: {queueInfo.session_active}/{queueInfo.session_limit}
+                </div>
+              )}
+            </div>
 
             {jobs.length === 0 && (
               <div className="card" style={{ padding: 32, textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
-                Nothing queued yet — add a video to get started.
+                Nothing queued for this browser yet — add a video to get started.
               </div>
             )}
 
             <div style={{ display: "grid", gap: 10 }}>
               {jobs.map((job) => (
-                <JobCard key={job.job_id} job={job} onSaveToDrive={saveToDrive} />
+                <JobCard key={job.job_id} job={job} sessionId={sessionId} onSaveToDrive={saveToDrive} />
               ))}
             </div>
           </section>
@@ -466,10 +623,18 @@ function StatPill({ label, value, tone }: { label: string; value: number; tone: 
   );
 }
 
-function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: string) => void }) {
+function JobCard({
+  job,
+  sessionId,
+  onSaveToDrive,
+}: {
+  job: Job;
+  sessionId: string;
+  onSaveToDrive: (jobId: string) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [viewing, setViewing] = useState(false);
-  const fileUrl = `${API_URL}/jobs/${job.job_id}/file`;
+  const fileUrl = `${API_URL}/jobs/${job.job_id}/file?session_id=${encodeURIComponent(sessionId)}`;
   const accent = statusAccent(job.status);
 
   return (
@@ -483,7 +648,7 @@ function JobCard({ job, onSaveToDrive }: { job: Job; onSaveToDrive: (jobId: stri
           </div>
           <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 2 }}>{job.original_filename}</div>
         </div>
-        <StatusPill status={job.status} />
+        <StatusPill status={job.status} queuePosition={job.queue_position} />
       </div>
 
       {job.status === "processing" && (
@@ -584,9 +749,9 @@ function statusAccent(status: JobStatus): string {
   }
 }
 
-function StatusPill({ status }: { status: JobStatus }) {
+function StatusPill({ status, queuePosition }: { status: JobStatus; queuePosition?: number | null }) {
   const map: Record<JobStatus, { label: string; fg: string; bg: string; pulse?: boolean }> = {
-    queued: { label: "Queued", fg: "var(--queued)", bg: "var(--queued-soft)" },
+    queued: { label: queuePosition ? `Queued — position ${queuePosition}` : "Queued", fg: "var(--queued)", bg: "var(--queued-soft)" },
     processing: { label: "Processing", fg: "var(--accent)", bg: "var(--accent-soft)", pulse: true },
     done: { label: "Done", fg: "var(--success)", bg: "var(--success-soft)" },
     failed: { label: "Failed", fg: "var(--danger)", bg: "var(--danger-soft)" },

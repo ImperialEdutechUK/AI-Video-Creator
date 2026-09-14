@@ -6,12 +6,15 @@ Streamlit app's core functions — the processing logic itself is unchanged;
 only the interface changed from a Streamlit UI to HTTP job endpoints.
 
 ## Endpoints
-- `POST /jobs` — multipart form (`course_name`, `unit_number`, `chapter_number`, `video`) → `{job_id}`. `chapter_number` is optional.
-- `GET /jobs` — lists every job (newest first) — powers the frontend's shared queue view
-- `GET /jobs/{id}` — `{status, progress[], error, result_filename, drive_status, drive_link, drive_error}`
-- `GET /jobs/{id}/file` — downloads the finished MP4 once `status == "done"`
-- `POST /jobs/{id}/drive` — one-click "Save to Google Drive". Only works once the job's `status == "done"`. Runs in the background; poll `GET /jobs/{id}` for `drive_status` (`idle` → `saving` → `saved`/`failed`).
-- `GET /healthz` — liveness check, also reports `workers` and `queue_depth`
+- `POST /jobs/preflight` — lightweight queue/disk-capacity check using file name/size. Returns a short-lived upload reservation token before the browser sends the large video body.
+- `DELETE /jobs/preflight/{token}` — releases an unused reservation (the frontend calls this after a cancelled/failed transfer).
+- `POST /jobs` — multipart form (`course_name`, `unit_number`, `chapter_number`, `video`) → `{job_id}`. Requires `X-Session-Id` and the preflight `X-Upload-Reservation` token.
+- `GET /jobs` — lists only jobs owned by the requesting browser session and returns team-wide queue/capacity metadata.
+- `GET /jobs/{id}` — returns one owned job, including `queue_position` while it is waiting.
+- `GET /jobs/{id}/file` — downloads/previews the finished MP4 once `status == "done"`; access is scoped to the owning browser session.
+- `POST /jobs/{id}/drive` — one-click "Save to Google Drive" for an owned finished job. Runs in the background; poll `GET /jobs/{id}` for `drive_status`.
+- `DELETE /jobs/{id}` — removes only an owned finished/failed job.
+- `GET /healthz` — liveness check plus worker, queue, disk-reservation and upload-limit information.
 
 ## Save to Google Drive
 
@@ -53,12 +56,24 @@ that course lands in the same place instead of creating duplicates.
 ## Job queue
 
 Jobs run through a small bounded worker pool (`WORKERS` env var, default 1)
-instead of one thread per upload. Submit as many videos as you want — extra
-ones sit with `status: "queued"` until a worker frees up, rather than all
-starting immediately and competing for the same CPU. That contention is
-usually what makes concurrent video processing *slower*, not faster, so the
-queue is also the fix for "make it faster" as much as it is for "let me
-queue more videos."
+instead of one processing thread per upload. Uploaded videos are streamed to
+`/tmp/slc-merger-jobs/<job-id>/` in small chunks and the queue stores only the
+input file path — never the complete video bytes in Python RAM. Extra jobs sit
+with `status: "queued"` until a worker frees up. The UI shows a global queue
+position (for example, `Queued — position 3`) without exposing other users'
+job details.
+
+For multi-user safety, the backend reserves a queue slot before each upload,
+enforces `MAX_QUEUED_JOBS` globally and `MAX_JOBS_PER_SESSION` per browser,
+and performs a conservative free-disk/headroom check before accepting the
+request body. Jobs are tagged with the browser's opaque `X-Session-Id`, so
+listing, Drive-save and delete operations cannot accidentally act on another
+browser's job. This is lightweight team isolation, not full user authentication.
+
+The pipeline also defaults to `PIPELINE_PREP_WORKERS=1`, so normalisation,
+intro generation and outro generation do not start several FFmpeg-heavy tasks
+at the same time on a small Railway instance. Larger plans can raise this to
+2 or 3 after checking CPU/RAM headroom.
 
 ## Deploy to Railway
 
@@ -71,17 +86,26 @@ queue more videos."
 4. Under **Variables**, add:
    - `FRONTEND_ORIGIN` = your Vercel URL, e.g. `https://your-app.vercel.app`
      (comma-separate multiple origins if needed; defaults to `*` if unset)
-   - `MAX_UPLOAD_MB` = `500` (optional, matches the original app's cap)
-   - `WORKERS` = how many videos process at once (default `1`). Video
-     encoding is CPU-bound, so this should match the number of CPU cores
-     your Railway plan actually gives you — setting it higher than that
-     makes concurrent jobs slower via contention, not faster. Check your
-     plan's vCPU count before raising this above 1.
+   - `MAX_UPLOAD_MB` = `500` (optional; uploads are rejected while streaming
+     once they exceed this size)
+   - `UPLOAD_CHUNK_MB` = `1` (optional; amount read into Python memory per
+     upload chunk)
+   - `WORKERS` = `1` (recommended for smaller Railway plans; controls how many
+     complete videos process at once)
+   - `PIPELINE_PREP_WORKERS` = `1` (recommended; controls FFmpeg-heavy prep
+     concurrency inside one video job; only raise to 2-3 with spare CPU/RAM)
+   - `MAX_QUEUED_JOBS` = `20` (recommended starting point; global waiting-upload cap)
+   - `MAX_JOBS_PER_SESSION` = `5` (active uploading/queued/processing jobs per browser)
+   - `MIN_FREE_DISK_MB` = `1024` (keep at least 1 GB unused as a storage safety reserve)
+   - `DISK_HEADROOM_FACTOR` = `2.5` (conservative source + FFmpeg scratch/output allowance)
+   - `UPLOAD_RESERVATION_TTL_SECONDS` = `3600` (stale preflight reservation expiry; 1 hour allows slow large uploads)
 5. Railway auto-assigns a public URL like
    `https://your-service-production.up.railway.app`. Copy it — the frontend
    needs it as `NEXT_PUBLIC_API_URL`.
-6. Test it: `curl https://your-service-production.up.railway.app/healthz`
-   should return `{"ok": true}`.
+6. Railway is configured by `railway.json` to use `/healthz` during deploy.
+   Test it manually as well: `curl https://your-service-production.up.railway.app/healthz`
+   should return `{"ok": true, ...}` including worker, queue, upload and free
+   work-disk information.
 
 ## Notes / limitations of this minimal build
 - **No Canva integration yet** — that was in the original Streamlit app
@@ -95,13 +119,19 @@ queue more videos."
   lost on redeploy/restart, and this won't scale past a single Railway
   instance. Fine for personal/small-team use; swap `JOBS` in `main.py` for
   Redis or a database if you need more durability or horizontal scaling.
-- **Queue is shared, not per-user** — `GET /jobs` returns every job on the
-  server, not scoped to whoever's asking. Fine for a small trusted team,
-  not fine if you expose this publicly without adding auth/scoping first.
-- **Large uploads** — Railway doesn't impose Vercel-style request timeouts,
-  but very long videos will still take real wall-clock time to process
-  (ffmpeg re-encoding isn't instant). The frontend polls every 2s so the
-  user sees live progress either way.
+- **Browser-session isolation, not login authentication** — each browser gets
+  an opaque local session id and sees/controls only its own jobs. This prevents
+  accidental cross-user actions for an internal team, but there are still no
+  named user accounts, SSO, roles, or password gate. Add real authentication
+  before exposing the service publicly.
+- **Large uploads** — upload bodies are streamed to disk instead of loaded
+  into RAM. The source upload is deleted as soon as processing finishes, and
+  large pipeline intermediates are deleted as soon as their next stage has
+  consumed them. Very long videos still take real wall-clock time to process.
+- **Restart behaviour** — job metadata is still in memory. A Railway restart
+  therefore clears the queue, and startup removes orphaned `/tmp` job files so
+  repeated crashes cannot slowly fill ephemeral storage. Add Redis/DB plus a
+  persistent volume/object store if jobs must survive restarts.
 - **Speed** — the pipeline already uses `libx264 -preset ultrafast` and
   skips re-encoding in `concat` wherever it safely can, so there wasn't
   free encode-speed left on the table. The `WORKERS` env var (see above)

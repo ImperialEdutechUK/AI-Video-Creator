@@ -1,8 +1,9 @@
 # SLC Video Merger — Frontend (Vercel)
 
-Minimal Next.js UI: a form (course name, unit number, video file), a
-progress log polled from the backend every 2 seconds, and a download link
-once the job finishes.
+Next.js UI for uploading and monitoring video jobs. Each browser generates a
+persistent opaque session id in local storage, so staff members see only their
+own jobs while still seeing team-wide queue capacity and their global waiting
+position. The backend enforces ownership on list, Drive-save and delete actions.
 
 ## Deploy to Vercel
 
