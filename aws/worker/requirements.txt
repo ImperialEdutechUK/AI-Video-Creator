@@ -1,0 +1,8 @@
+# Same processing dependencies as backend/requirements.txt (minus the web
+# framework and Google libraries, which the worker does not use), plus boto3
+# for S3/DynamoDB access.
+Pillow>=10.0
+numpy
+opencv-python-headless>=4.8
+pytesseract
+boto3>=1.34

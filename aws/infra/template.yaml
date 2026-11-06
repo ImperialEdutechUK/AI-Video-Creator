@@ -1,0 +1,666 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SLC Video Merger on AWS - static site (S3 + CloudFront), API (Lambda
+  Function URL), job state (DynamoDB on-demand) and an on-demand video worker
+  (ECS Fargate Spot). Nothing runs - and almost nothing is billed - while no
+  videos are being processed.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: slc-video-aws
+  WorkerImageUri:
+    Type: String
+    Description: ECR image URI (with tag) for the video worker.
+  WorkerCpu:
+    Type: String
+    Default: "8192"
+    AllowedValues: ["2048", "4096", "8192", "16384"]
+    Description: >-
+      Measured on a real 8-min lesson: 2 vCPU 177 s, 4 vCPU 89 s, 8 vCPU 49 s.
+      Fargate bills per vCPU-second, so bigger is ~the same cost per video, just faster.
+  WorkerMemory:
+    Type: String
+    Default: "16384"
+    AllowedValues: ["4096", "8192", "16384", "32768"]
+  PipelinePrepWorkers:
+    Type: String
+    Default: "3"
+    AllowedValues: ["1", "2", "3"]
+    Description: Intro, outro and normalise run in parallel (pipeline's own setting for larger hosts).
+  MaxWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 4
+    Description: Same meaning as WORKERS on Railway - videos processed at once.
+  OutputRetentionDays:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: Finished videos not yet removed are deleted from S3 after this many days.
+  MaxUploadMb:
+    Type: Number
+    Default: 500
+  MaxQueuedJobs:
+    Type: Number
+    Default: 20
+  MaxJobsPerSession:
+    Type: Number
+    Default: 5
+  AllowOnDemandFallback:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Start a regular (non-Spot) Fargate task if Spot capacity is unavailable.
+  AllowProductionDriveFolder:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Safety switch. Keep false while testing so the live Drive folder can never be written to.
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Email address for monthly cost alerts.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional custom domain for the website, e.g. webtool.imperial.imet.lk
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route 53 hosted zone that contains DomainName.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate (us-east-1) for DomainName, from certificate.yaml.
+
+Conditions:
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+
+Resources:
+  # ── Network: own VPC with public subnets, no NAT gateway (NAT ≈ $36/month) ──
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref ProjectName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Ref ProjectName }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Ref ProjectName }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Gateway endpoints are free and keep S3/DynamoDB traffic inside AWS.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds: [!Ref PublicRouteTable]
+
+  DynamoDbGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      RouteTableIds: [!Ref PublicRouteTable]
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SLC video worker - outbound only, no inbound access
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-worker" }]
+
+  # ── Storage ────────────────────────────────────────────────────────────
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-media-${AWS::AccountId}
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-stray-uploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 1
+          - Id: expire-finished-videos
+            Status: Enabled
+            Prefix: outputs/
+            ExpirationInDays: !Ref OutputRetentionDays
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !If
+              - HasDomain
+              - [!Sub "https://${SiteDistribution.DomainName}", !Sub "https://${DomainName}"]
+              - [!Sub "https://${SiteDistribution.DomainName}"]
+            AllowedMethods: [GET, HEAD, POST, PUT]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-site-${AWS::AccountId}
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${ProjectName}-site-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${ProjectName} frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Aliases: !If [HasDomain, [!Ref DomainName], !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
+  # ── Job state ──────────────────────────────────────────────────────────
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sid, AttributeType: S }
+        - { AttributeName: active, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: N }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by_session
+          KeySchema:
+            - { AttributeName: sid, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: active
+          KeySchema:
+            - { AttributeName: active, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [qstate, sid]
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── Video worker (ECS Fargate Spot, started on demand) ─────────────────
+  WorkerCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/worker
+      RetentionInDays: 7
+
+  WorkerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-worker-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-worker-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub "${JobsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub "${MediaBucket.Arn}/uploads/*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${MediaBucket.Arn}/outputs/*"
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-worker
+      Cpu: !Ref WorkerCpu
+      Memory: !Ref WorkerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64 # Fargate Spot is x86-only
+      ExecutionRoleArn: !GetAtt WorkerExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Ref WorkerImageUri
+          Essential: true
+          StopTimeout: 120
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: JOBS_TABLE, Value: !Ref JobsTable }
+            - { Name: MEDIA_BUCKET, Value: !Ref MediaBucket }
+            - { Name: OUTPUT_RETENTION_DAYS, Value: !Ref OutputRetentionDays }
+            - { Name: IDLE_EXIT_SECONDS, Value: "120" }
+            - { Name: PIPELINE_PREP_WORKERS, Value: !Ref PipelinePrepWorkers }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  # ── API (Lambda Function URL - no API Gateway charges) ─────────────────
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-api
+      RetentionInDays: 7
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-api
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ApiLogGroup.Arn}"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub "${JobsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${MediaBucket.Arn}/*"
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-worker:*
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt WorkerCluster.Arn
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt WorkerCluster.Arn
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}/*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt WorkerExecutionRole.Arn, !GetAtt WorkerTaskRole.Arn]
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-api
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-api
+      Description: SLC Video Merger API, Drive saves and worker reconciler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: handler.handler
+      Code: ../api/build
+      MemorySize: 512
+      Timeout: 600
+      EphemeralStorage: { Size: 2048 }
+      Role: !GetAtt ApiRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          MEDIA_BUCKET: !Ref MediaBucket
+          WORKER_CLUSTER: !Ref WorkerCluster
+          WORKER_TASK_FAMILY: !Sub ${ProjectName}-worker
+          WORKER_SUBNETS: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+          WORKER_SECURITY_GROUP: !Ref WorkerSecurityGroup
+          SSM_PREFIX: !Sub /${ProjectName}
+          MAX_UPLOAD_MB: !Ref MaxUploadMb
+          MAX_QUEUED_JOBS: !Ref MaxQueuedJobs
+          MAX_JOBS_PER_SESSION: !Ref MaxJobsPerSession
+          WORKERS: !Ref MaxWorkers
+          OUTPUT_RETENTION_DAYS: !Ref OutputRetentionDays
+          ALLOW_ON_DEMAND_FALLBACK: !Ref AllowOnDemandFallback
+          ALLOW_PRODUCTION_DRIVE_FOLDER: !Ref AllowProductionDriveFolder
+    DependsOn: WorkerTaskDefinition
+
+  # Async Drive saves must never be retried automatically (a retry after a
+  # timeout could upload the same video to Drive twice).
+  ApiAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+  ApiFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins: !If
+          - HasDomain
+          - [!Sub "https://${SiteDistribution.DomainName}", !Sub "https://${DomainName}"]
+          - [!Sub "https://${SiteDistribution.DomainName}"]
+        AllowMethods: [GET, POST, DELETE]
+        AllowHeaders: [content-type, x-session-id, x-upload-reservation]
+        MaxAge: 600
+
+  ApiFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ApiFunctionUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  ReconcileSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-reconcile
+      Description: Restart work after Spot interruptions and expire stale upload reservations
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: api
+          Arn: !GetAtt ApiFunction.Arn
+          Input: '{"action": "reconcile"}'
+
+  ReconcilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReconcileSchedule.Arn
+
+  # ── Cost guard ─────────────────────────────────────────────────────────
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub ${ProjectName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - !Sub "user:Project$${ProjectName}"
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+
+  # DNS: webtool.<zone> -> CloudFront (alias records are free).
+  SiteDnsRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # CloudFront's fixed hosted zone id
+
+  SiteDnsRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  SiteUrl:
+    Value: !If
+      - HasDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${SiteDistribution.DomainName}"
+  CloudFrontUrl:
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+  ApiUrl:
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref SiteDistribution
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  JobsTableName:
+    Value: !Ref JobsTable
+  WorkerClusterName:
+    Value: !Ref WorkerCluster

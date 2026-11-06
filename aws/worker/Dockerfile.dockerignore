@@ -1,0 +1,7 @@
+# Build context is the repo root; only send what the worker image needs.
+*
+!backend/app
+!aws/worker/requirements.txt
+!aws/worker/worker.py
+**/__pycache__
+**/*.pyc

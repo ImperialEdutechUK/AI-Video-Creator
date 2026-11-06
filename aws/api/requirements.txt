@@ -1,0 +1,5 @@
+# Bundled into the API Lambda zip (boto3 is provided by the Lambda runtime).
+# Same Google libraries as backend/requirements.txt, used only by the
+# "Save to Google Drive" action via the unmodified backend/app/drive.py.
+google-api-python-client>=2.130
+google-auth>=2.30
