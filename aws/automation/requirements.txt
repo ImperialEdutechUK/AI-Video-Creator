@@ -1,0 +1,4 @@
+# NotebookLM download task (aws/automation/Dockerfile). Versions pinned so a
+# rebuild can't silently change browser behaviour.
+playwright==1.49.1
+boto3>=1.34

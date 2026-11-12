@@ -134,6 +134,99 @@ you set them explicitly, so a routine redeploy never re-locks production or remo
 
 Rollback at any point: the team goes back to the Railway/Vercel URL, which has kept running throughout.
 
+## Sheet automation (Excel log → NotebookLM → Drive)
+
+Every 30 minutes, with nobody involved, the automation does the manual steps for each new row of the
+"Chapterwise AI video log" tab:
+
+1. **Reads the workbook** (Microsoft Graph) and takes rows that have a NotebookLM link in G, unit and
+   chapter in D/E, and **empty H and I**. It writes `auto` in H straight away so people can see the row is taken.
+   Rows with someone's name in H are never touched. Cell colours are ignored.
+2. **Cleans the course name.** The awarding body is removed from the start (`Qualifi` + `Qualifi Level 03 …`
+   → `Level 03 …`). Unit 14 / chapter 4 become `Unit 14` / `Chapter 4`, exactly as typed in the web app.
+3. **Downloads the video** in a temporary cloud browser (Fargate Spot, headless Chromium) signed in as the
+   content team's Google account. It opens the link, goes to the notebook (direct video links have no
+   download option), finds the Studio item titled `U14C4`, and downloads it. If there is no match, or more
+   than one *video* matches, nothing is guessed: the row becomes NO.
+4. **Processes it** with the normal video worker (same pipeline as the web app) and **saves to Drive**
+   (same `drive.py`, same folders and names). If that chapter is already in the course folder, it is not
+   uploaded again.
+5. **Checks Drive.** It re-reads the file by ID and checks the folder, the name, the size and the MD5
+   against what was uploaded. Only then does it write **I = `Yes`**. Any failure writes **I = `NO`**.
+   NO rows are retried automatically on later runs (3 attempts in all). To make the bot try again from
+   scratch, clear the I cell.
+6. **Cleans up.** The video's S3 copies are deleted as soon as it is verified in Drive. Leftovers expire on
+   their own (uploads: 1 day; outputs: `OutputRetentionDays`; failure screenshots: 7 days).
+
+Emails go to `AlertEmail`: "sign in again" alerts (at most every 12 h) and a daily summary at 16:00 UTC
+with the rows marked Yes/NO and the reasons. No email is sent on days with no activity.
+Cost: the 30-minute check is a few seconds of Lambda. The browser task (2 vCPU Spot) runs only when rows
+are waiting. Expect roughly $1–3/month.
+
+**Safety switches** (both default to test mode):
+- `AllowProductionSheet=false`: the automation only writes to a workbook whose file name contains **TEST**.
+- `AllowProductionDriveFolder=false` (existing): Drive saves can only go to the test folder.
+- `AutomationEnabled=false`: nothing runs on a schedule until you turn it on.
+
+### Setup (once)
+
+0. **Deploy role:** give it the new SNS permission. Re-run
+   `bash aws/scripts/setup-deployer.sh <iam-capable-profile>` (it only updates the role's policy).
+1. **Entra app registration.** Someone allowed to register apps in the Microsoft 365 tenant does this:
+   Entra admin centre → App registrations → New registration → name `SLC Video Automation`,
+   *Accounts in this organizational directory only*, no redirect URI. Then:
+   - Authentication → *Allow public client flows* = **Yes**.
+   - API permissions → Microsoft Graph → Delegated: `Files.ReadWrite.All`, `offline_access`,
+     `User.Read` (none of these normally needs admin consent; if the tenant blocks user consent, an admin
+     clicks *Grant admin consent*).
+   - Note the **Application (client) ID** and **Directory (tenant) ID**.
+2. **Test copy of the log.** In OneDrive: *Save a copy* of the workbook named e.g.
+   `TEST - Chapterwise AI video log`, and copy its sharing link. Remove most old rows, or use the start
+   date below, so testing only processes a few videos.
+3. **Separate test Drive folder.** Create a new empty folder, e.g. `Automation TEST`, in the Drive
+   account the app uploads with, then point the deployment at it:
+   `powershell -ExecutionPolicy Bypass -File aws\scripts\set-drive-config.ps1` (or
+   `bash aws/scripts/set-drive-config.sh folder`).
+4. **Deploy** (Docker Desktop must be running). The automation stays switched off:
+   `ALERT_EMAIL=<team address> bash aws/scripts/deploy.sh`
+   The alert address receives an "AWS Notification - Subscription Confirmation" email. Click *Confirm*.
+5. **Connect Excel:** `py -3.12 aws\scripts\automation_microsoft_signin.py`. Enter the IDs from step 1,
+   the TEST copy's link and an optional start date, then sign in at microsoft.com/devicelogin with an
+   account that can edit the copy. It then lists, read-only, the rows it would take and their cleaned
+   course names. Check them.
+6. **Connect Google:** `py -3.12 aws\scripts\automation_google_signin.py`. Chrome opens with an empty
+   profile; sign in to the content team account and wait for NotebookLM to list the notebooks, then press
+   Enter. **Don't click "Sign out"** in that window afterwards; just close it.
+   Then try the real download steps on this PC with a row you know:
+   `py -3.12 aws\scripts\automation_google_signin.py --skip-signin --probe <link from G> --unit 14 --chapter 4`
+
+### Test
+
+```
+py -3.12 aws\scripts\automation_admin.py dry-run   # what it WOULD take; writes nothing
+AUTOMATION_ENABLED=true SKIP_IMAGE=1 IMAGE_TAG=<worker tag> bash aws/scripts/deploy.sh
+py -3.12 aws\scripts\automation_admin.py run-now   # don't wait for the 30-minute schedule
+py -3.12 aws\scripts\automation_admin.py status    # every row's progress and failure reason
+```
+
+Check that H shows `auto` within a minute, I shows `Yes` after processing (about 3–6 min per video), and the
+files are in the **test** Drive folder as `<Awarding Body> - <Course>/Unit X | Chapter Y.mp4`. Also try
+the failure paths: a wrong unit number (→ NO with "No Studio item titled …"), and a
+row with a person's name in H (→ untouched).
+
+### Cutover to the real log (only after the test passes)
+
+1. `py -3.12 aws\scripts\automation_microsoft_signin.py` again. This time enter the **real** workbook link
+   and a **start date** (e.g. today), so old rows with empty H/I aren't all processed at once.
+2. Do the Drive cutover above (production folder + `ALLOW_PRODUCTION_DRIVE_FOLDER=true`).
+3. `ALLOW_PRODUCTION_SHEET=true SKIP_IMAGE=1 IMAGE_TAG=<tag> bash aws/scripts/deploy.sh`
+
+**Switch off at any time:** `AUTOMATION_ENABLED=false SKIP_IMAGE=1 IMAGE_TAG=<tag> bash aws/scripts/deploy.sh`.
+Rows already in H=`auto` with empty I can then be finished by hand: put your name in H.
+
+**When Google or Microsoft ask for a new sign-in** (the email says which), re-run step 5 or 6. Waiting rows
+continue on the next run, and nothing is lost.
+
 ## Updating
 
 ```bash

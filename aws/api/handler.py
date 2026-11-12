@@ -16,9 +16,14 @@ The same function also handles two non-HTTP events:
   {"action": "drive_save", "job_id": ...}  async "Save to Google Drive"
   {"action": "reconcile"}                 1-minute schedule: requeue jobs from
                                           dead workers, expire reservations,
-                                          make sure a worker runs if needed.
+                                          make sure a worker runs if needed,
+                                          and advance sheet automation rows.
+  {"action": "automation_tick" | "automation_dry_run" | "automation_daily" |
+             "automation_alert"}          sheet -> NotebookLM -> Drive automation
+                                          (see automation.py)
 """
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -73,6 +78,8 @@ s3 = boto3.client(
 )
 ecs = boto3.client("ecs", region_name=REGION)
 lambda_client = boto3.client("lambda", region_name=REGION)
+
+import automation  # noqa: E402  (sheet -> NotebookLM -> Drive automation)
 
 
 class HTTPError(Exception):
@@ -266,6 +273,10 @@ def healthz(_req) -> dict:
         drive_mode, drive_folder = _drive_module().auth_mode(), _drive_root_folder_id()
     except Exception as e:  # a Drive problem must not take the health check down
         drive_mode, drive_folder = f"error: {e.__class__.__name__}", ""
+    try:
+        auto_status = automation.status()
+    except Exception as e:
+        auto_status = {"error": e.__class__.__name__}
     return _response(200, {
         "ok": True,
         "platform": "aws",
@@ -280,6 +291,7 @@ def healthz(_req) -> dict:
         "output_retention_days": OUTPUT_RETENTION_DAYS,
         "drive_auth_mode": drive_mode,
         "drive_root_folder_id": drive_folder,
+        "automation": auto_status,
     })
 
 
@@ -623,16 +635,44 @@ def run_drive_save(job_id: str) -> None:
                 "Drive folder. Point gdrive/folder_url at the test folder, or set "
                 "AllowProductionDriveFolder=true at cutover."
             )
-        s3.download_file(BUCKET, job["result_key"], str(local))
-        result = drive.upload_video(
-            job["course_name"], job["unit_number"], job.get("chapter_number", ""), str(local),
-            awarding_body=job.get("awarding_body", ""),
-        )
+        extra = {}
+        result = None
+        if job.get("auto"):
+            # Automated rows: if this chapter is already in the course folder
+            # (e.g. a retry after the upload succeeded), never upload it twice.
+            result = automation.find_existing_drive_file(drive, job)
+            if result:
+                extra[":pre"] = True
+        if result is None:
+            s3.download_file(BUCKET, job["result_key"], str(local))
+            if job.get("auto"):
+                md5 = hashlib.md5()
+                with open(local, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+                        md5.update(chunk)
+                extra[":md5"] = md5.hexdigest()
+                extra[":size"] = local.stat().st_size
+            if job.get("auto"):
+                # Own folder setting: in test mode the automation must upload to
+                # its separate TEST folder, never to the folder the team uses.
+                result = automation.upload_video(drive, job, local)
+            else:
+                result = drive.upload_video(
+                    job["course_name"], job["unit_number"], job.get("chapter_number", ""), str(local),
+                    awarding_body=job.get("awarding_body", ""),
+                )
+        sets ="drive_status = :s, drive_link = :l, drive_file_id = :fid"
+        if ":md5" in extra:
+            sets += ", drive_md5 = :md5, drive_size = :size"
+        if ":pre" in extra:
+            sets += ", drive_preexisting = :pre"
         table.update_item(
             Key={"pk": f"JOB#{job_id}"},
-            UpdateExpression="SET drive_status = :s, drive_link = :l REMOVE drive_error",
+            UpdateExpression=f"SET {sets} REMOVE drive_error",
             ConditionExpression="attribute_exists(pk)",
-            ExpressionAttributeValues={":s": "saved", ":l": result.get("web_view_link")},
+            ExpressionAttributeValues={
+                ":s": "saved", ":l": result.get("web_view_link"), ":fid": result.get("file_id", ""), **extra,
+            },
         )
     except Exception as e:
         log.exception("Drive save failed for job %s", job_id)
@@ -712,6 +752,10 @@ def reconcile() -> dict:
         active.append(i)
 
     ensure_worker([i for i in active if i.get("qstate") in ("queued", "processing")])
+    try:
+        automation.follow_up()
+    except Exception:
+        log.exception("Automation follow-up failed")  # never let it break the job reconciler
     if requeued or failed or expired:
         log.info("Reconcile: requeued=%s failed=%s expired_reservations=%s", requeued, failed, expired)
     return {"requeued": requeued, "failed": failed, "expired_reservations": expired}
@@ -759,6 +803,14 @@ def handler(event, context):
         return {"ok": True}
     if action == "reconcile":
         return reconcile()
+    if action == "automation_tick":
+        return automation.tick()
+    if action == "automation_dry_run":
+        return automation.tick(dry_run=True)
+    if action == "automation_daily":
+        return automation.daily_summary()
+    if action == "automation_alert":
+        return automation.handle_alert_event(event)
 
     req = _parse_request(event)
     path_matched = False

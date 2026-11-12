@@ -29,6 +29,28 @@ Resources:
             ]
           }
 
+  # Separate repository for the NotebookLM download task, so its images never
+  # push the video worker's images out of the "keep 3" lifecycle rule.
+  AutomationRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-automation
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the 3 most recent images (storage is billed per GB)",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 3 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
   ArtifactsBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -60,3 +82,5 @@ Outputs:
     Value: !GetAtt WorkerRepository.RepositoryUri
   ArtifactsBucketName:
     Value: !Ref ArtifactsBucket
+  AutomationRepositoryUri:
+    Value: !GetAtt AutomationRepository.RepositoryUri

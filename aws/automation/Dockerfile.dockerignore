@@ -1,0 +1,6 @@
+# Build context is the repo root; only send what the automation image needs.
+*
+!aws/automation/requirements.txt
+!aws/automation/notebooklm.py
+!aws/automation/runner.py
+!aws/automation/rules.py

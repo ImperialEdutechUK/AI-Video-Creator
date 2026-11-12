@@ -12,6 +12,14 @@
 #   ALLOW_PRODUCTION_DRIVE_FOLDER=true  ONLY at cutover (default: keep current value)
 #   WORKER_CPU / WORKER_MEMORY        worker size (default 8192 / 16384 = 8 vCPU / 16 GB)
 #   PIPELINE_PREP_WORKERS / MAX_WORKERS  (default 3 / 2)
+#   Sheet automation (all keep their current deployed value unless given):
+#   AUTOMATION_IMAGE_TAG=<tag>        reuse this NotebookLM-task image (with SKIP_IMAGE=1)
+#   BUILD_AUTOMATION_IMAGE=1          with SKIP_IMAGE=1: rebuild only the NotebookLM-task image
+#   AUTOMATION_ENABLED=true|false     run the 30-minute automation (default false)
+#   ALLOW_PRODUCTION_SHEET=true       ONLY at cutover (default false = TEST workbook only)
+#   AUTOMATION_MAX_PER_RUN=<n>        new rows per run (default 5)
+#   AUTOMATION_INTERVAL_MINUTES=<n>   minutes between runs (default 10)
+#   ALERT_EMAIL=<address>             alerts + daily summary
 # (CloudFormation keeps a stack's previous parameter values unless they are
 #  passed, so the worker settings are always passed explicitly here.)
 set -euo pipefail
@@ -38,6 +46,15 @@ ALLOW_PROD_DRIVE="${ALLOW_PRODUCTION_DRIVE_FOLDER:-$(current_param AllowProducti
 ALLOW_PROD_DRIVE="${ALLOW_PROD_DRIVE:-false}"
 DOMAIN_NAME="${DOMAIN_NAME-$(current_param DomainName)}"
 HOSTED_ZONE_ID="${HOSTED_ZONE_ID-$(current_param HostedZoneId)}"
+AUTOMATION_ENABLED="${AUTOMATION_ENABLED:-$(current_param AutomationEnabled)}"
+AUTOMATION_ENABLED="${AUTOMATION_ENABLED:-false}"
+ALLOW_PROD_SHEET="${ALLOW_PRODUCTION_SHEET:-$(current_param AllowProductionSheet)}"
+ALLOW_PROD_SHEET="${ALLOW_PROD_SHEET:-false}"
+AUTOMATION_MAX_PER_RUN="${AUTOMATION_MAX_PER_RUN:-$(current_param AutomationMaxPerRun)}"
+AUTOMATION_MAX_PER_RUN="${AUTOMATION_MAX_PER_RUN:-5}"
+AUTOMATION_INTERVAL="${AUTOMATION_INTERVAL_MINUTES:-$(current_param AutomationIntervalMinutes)}"
+AUTOMATION_INTERVAL="${AUTOMATION_INTERVAL:-10}"
+ALERT_EMAIL="${ALERT_EMAIL-$(current_param AlertEmail)}"
 
 step "Deploying as: $(aws_ sts get-caller-identity --query Arn --output text)"
 
@@ -79,18 +96,36 @@ if [[ -n "$DOMAIN_NAME" ]]; then
 fi
 
 REPO_URI="$(output "$PROJECT-bootstrap" WorkerRepositoryUri)"
+AUTO_REPO_URI="$(output "$PROJECT-bootstrap" AutomationRepositoryUri)"
 ARTIFACTS="$(output "$PROJECT-bootstrap" ArtifactsBucketName)"
 
 if [[ "${SKIP_IMAGE:-0}" == "1" ]]; then
   TAG="${IMAGE_TAG:?Set IMAGE_TAG when SKIP_IMAGE=1}"
   step "Reusing worker image $REPO_URI:$TAG"
+  # The NotebookLM-task image keeps its current tag unless one is given,
+  # or is rebuilt on its own with BUILD_AUTOMATION_IMAGE=1.
+  CUR_AUTO_IMAGE="$(current_param AutomationImageUri)"
+  AUTO_TAG="${AUTOMATION_IMAGE_TAG:-${CUR_AUTO_IMAGE##*:}}"
+  if [[ "${BUILD_AUTOMATION_IMAGE:-0}" == "1" ]]; then
+    AUTO_TAG="auto-$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+    step "Building NotebookLM download image $AUTO_REPO_URI:$AUTO_TAG"
+    docker build --platform linux/amd64 -f aws/automation/Dockerfile -t "$AUTO_REPO_URI:$AUTO_TAG" .
+    aws_ ecr get-login-password | docker login --username AWS --password-stdin "${AUTO_REPO_URI%%/*}"
+    docker push "$AUTO_REPO_URI:$AUTO_TAG"
+  fi
 else
   TAG="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+  AUTO_TAG="$TAG"
   step "Building worker image $REPO_URI:$TAG"
   docker build --platform linux/amd64 -f aws/worker/Dockerfile -t "$REPO_URI:$TAG" .
   aws_ ecr get-login-password | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
   docker push "$REPO_URI:$TAG"
+  step "Building NotebookLM download image $AUTO_REPO_URI:$AUTO_TAG"
+  docker build --platform linux/amd64 -f aws/automation/Dockerfile -t "$AUTO_REPO_URI:$AUTO_TAG" .
+  docker push "$AUTO_REPO_URI:$AUTO_TAG"
 fi
+AUTO_IMAGE=""
+[[ -n "$AUTO_TAG" ]] && AUTO_IMAGE="$AUTO_REPO_URI:$AUTO_TAG"
 
 step "Packaging API Lambda"
 rm -rf aws/api/build aws/.build
@@ -100,6 +135,7 @@ mkdir -p aws/api/build aws/.build
   --only-binary=:all: --upgrade --no-warn-conflicts
 cp aws/api/handler.py aws/api/build/handler.py
 cp backend/app/drive.py aws/api/build/drive.py   # unmodified Drive logic
+cp aws/api/automation.py aws/automation/rules.py aws/automation/excel.py aws/api/build/
 # Keep only the Drive discovery document (saves ~90 MB and cold-start time).
 find aws/api/build/googleapiclient/discovery_cache/documents -type f ! -name 'drive.v3.json' -delete
 find aws/api/build -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -125,6 +161,12 @@ aws_ cloudformation deploy --stack-name "$PROJECT" \
     DomainName="$DOMAIN_NAME" \
     HostedZoneId="$HOSTED_ZONE_ID" \
     CertificateArn="$CERT_ARN" \
+    AutomationImageUri="$AUTO_IMAGE" \
+    AutomationEnabled="$AUTOMATION_ENABLED" \
+    AllowProductionSheet="$ALLOW_PROD_SHEET" \
+    AutomationMaxPerRun="$AUTOMATION_MAX_PER_RUN" \
+    AutomationIntervalMinutes="$AUTOMATION_INTERVAL" \
+    AlertEmail="$ALERT_EMAIL" \
   --tags Project="$PROJECT" --no-fail-on-empty-changeset
 
 API_URL="$(output "$PROJECT" ApiUrl)"
@@ -150,3 +192,4 @@ echo "Website : $SITE_URL"
 echo "API     : $API_URL"
 echo "Health  : ${API_URL%/}/healthz"
 echo "Worker image tag: $TAG"
+echo "Automation      : enabled=$AUTOMATION_ENABLED production_sheet=$ALLOW_PROD_SHEET every=${AUTOMATION_INTERVAL}min max_per_run=$AUTOMATION_MAX_PER_RUN image=${AUTO_TAG:-none}"

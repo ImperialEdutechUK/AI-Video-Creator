@@ -36,6 +36,8 @@
     { "Sid": "ProjectLogs", "Effect": "Allow", "Action": "logs:*",
       "Resource": ["arn:aws:logs:*:${ACCOUNT_ID}:log-group:/${PROJECT}/*", "arn:aws:logs:*:${ACCOUNT_ID}:log-group:/${PROJECT}/*:*", "arn:aws:logs:*:${ACCOUNT_ID}:log-group:/aws/lambda/${PROJECT}-*", "arn:aws:logs:*:${ACCOUNT_ID}:log-group:/aws/lambda/${PROJECT}-*:*"] },
     { "Sid": "LogsDescribe", "Effect": "Allow", "Action": "logs:DescribeLogGroups", "Resource": "*" },
+    { "Sid": "ProjectAlertTopics", "Effect": "Allow", "Action": "sns:*",
+      "Resource": "arn:aws:sns:*:${ACCOUNT_ID}:${PROJECT}-*" },
     { "Sid": "ProjectSchedule", "Effect": "Allow", "Action": "events:*",
       "Resource": "arn:aws:events:*:${ACCOUNT_ID}:rule/${PROJECT}-*" },
     { "Sid": "ProjectParameters", "Effect": "Allow",

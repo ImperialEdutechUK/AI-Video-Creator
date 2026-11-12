@@ -77,10 +77,46 @@ Parameters:
     Type: String
     Default: ""
     Description: ACM certificate (us-east-1) for DomainName, from certificate.yaml.
+  # ── Sheet -> NotebookLM -> Drive automation ──
+  AutomationImageUri:
+    Type: String
+    Default: ""
+    Description: ECR image URI (with tag) for the NotebookLM download task.
+  AutomationEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Run the 30-minute sheet automation and the daily summary.
+  AllowProductionSheet:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Safety switch. While false, the automation only writes to a workbook with TEST in its name.
+  AutomationMaxPerRun:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 50
+    Description: Most new sheet rows the automation takes on per run.
+  AutomationIntervalMinutes:
+    Type: Number
+    Default: 10
+    MinValue: 5
+    MaxValue: 120
+    Description: How often the automation checks the sheet for new rows.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for automation alerts (sign-in needed) and the daily summary. The recipient confirms the AWS subscription email once.
 
 Conditions:
   HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
   HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasAutomationImage: !Not [!Equals [!Ref AutomationImageUri, ""]]
+  AutomationOn: !And
+    - !Equals [!Ref AutomationEnabled, "true"]
+    - !Condition HasAutomationImage
 
 Resources:
   # ── Network: own VPC with public subnets, no NAT gateway (NAT ≈ $36/month) ──
@@ -199,6 +235,10 @@ Resources:
             Status: Enabled
             Prefix: outputs/
             ExpirationInDays: !Ref OutputRetentionDays
+          - Id: expire-automation-screenshots
+            Status: Enabled
+            Prefix: automation/debug/
+            ExpirationInDays: 7
           - Id: abort-incomplete-multipart
             Status: Enabled
             AbortIncompleteMultipartUpload:
@@ -466,6 +506,8 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Query
                   - dynamodb:ConditionCheckItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Scan
                 Resource:
                   - !GetAtt JobsTable.Arn
                   - !Sub "${JobsTable.Arn}/index/*"
@@ -474,7 +516,9 @@ Resources:
                 Resource: !Sub "${MediaBucket.Arn}/*"
               - Effect: Allow
                 Action: ecs:RunTask
-                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-worker:*
+                Resource:
+                  - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-worker:*
+                  - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-automation:*
                 Condition:
                   ArnEquals:
                     ecs:cluster: !GetAtt WorkerCluster.Arn
@@ -487,15 +531,26 @@ Resources:
               - Effect: Allow
                 Action: ecs:TagResource
                 Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}/*
+              # Backstop: stop a NotebookLM download task that runs too long.
+              - Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}/*
               - Effect: Allow
                 Action: iam:PassRole
-                Resource: [!GetAtt WorkerExecutionRole.Arn, !GetAtt WorkerTaskRole.Arn]
+                Resource: [!GetAtt WorkerExecutionRole.Arn, !GetAtt WorkerTaskRole.Arn, !GetAtt AutomationTaskRole.Arn]
                 Condition:
                   StringEquals:
                     iam:PassedToService: ecs-tasks.amazonaws.com
               - Effect: Allow
                 Action: ssm:GetParameters
                 Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+              # Microsoft rotates the Excel sign-in token on use; the new one is stored back.
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/automation/ms/refresh_token
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-api
@@ -531,6 +586,11 @@ Resources:
           OUTPUT_RETENTION_DAYS: !Ref OutputRetentionDays
           ALLOW_ON_DEMAND_FALLBACK: !Ref AllowOnDemandFallback
           ALLOW_PRODUCTION_DRIVE_FOLDER: !Ref AllowProductionDriveFolder
+          AUTOMATION_ENABLED: !If [AutomationOn, "true", "false"]
+          ALLOW_PRODUCTION_SHEET: !Ref AllowProductionSheet
+          AUTOMATION_MAX_PER_RUN: !Ref AutomationMaxPerRun
+          AUTOMATION_TASK_FAMILY: !If [HasAutomationImage, !Sub "${ProjectName}-automation", ""]
+          ALERT_TOPIC_ARN: !Ref AlertTopic
     DependsOn: WorkerTaskDefinition
 
   # Async Drive saves must never be retried automatically (a retry after a
@@ -591,6 +651,133 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ReconcileSchedule.Arn
+
+  # ── Sheet -> NotebookLM -> Drive automation ────────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-automation-alerts
+      DisplayName: SLC Video Automation
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AutomationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/automation
+      RetentionInDays: 14
+
+  AutomationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-automation-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: automation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub "${JobsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${MediaBucket.Arn}/automation/*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${MediaBucket.Arn}/uploads/auto/*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-api
+
+  AutomationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasAutomationImage
+    Properties:
+      Family: !Sub ${ProjectName}-automation
+      Cpu: "2048"
+      Memory: "4096"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt WorkerExecutionRole.Arn
+      TaskRoleArn: !GetAtt AutomationTaskRole.Arn
+      ContainerDefinitions:
+        - Name: automation
+          Image: !Ref AutomationImageUri
+          Essential: true
+          StopTimeout: 30
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: JOBS_TABLE, Value: !Ref JobsTable }
+            - { Name: MEDIA_BUCKET, Value: !Ref MediaBucket }
+            - { Name: API_FUNCTION, Value: !Sub "${ProjectName}-api" }
+            - { Name: MAX_QUEUED_JOBS, Value: !Ref MaxQueuedJobs }
+            - { Name: MAX_ACTIVE_AUTO_JOBS, Value: "6" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AutomationLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: automation
+
+  AutomationTickSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-automation-tick
+      Description: Read the Excel log and download new NotebookLM videos
+      ScheduleExpression: !Sub "rate(${AutomationIntervalMinutes} minutes)"
+      State: !If [AutomationOn, ENABLED, DISABLED]
+      Targets:
+        - Id: api
+          Arn: !GetAtt ApiFunction.Arn
+          Input: '{"action": "automation_tick"}'
+
+  AutomationTickPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutomationTickSchedule.Arn
+
+  AutomationDailySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-automation-daily
+      Description: Daily automation summary email (16:00 UTC)
+      ScheduleExpression: cron(0 16 * * ? *)
+      State: !If [AutomationOn, ENABLED, DISABLED]
+      Targets:
+        - Id: api
+          Arn: !GetAtt ApiFunction.Arn
+          Input: '{"action": "automation_daily"}'
+
+  AutomationDailyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutomationDailySchedule.Arn
 
   # ── Cost guard ─────────────────────────────────────────────────────────
   MonthlyBudget:
@@ -664,3 +851,5 @@ Outputs:
     Value: !Ref JobsTable
   WorkerClusterName:
     Value: !Ref WorkerCluster
+  AlertTopicArn:
+    Value: !Ref AlertTopic
