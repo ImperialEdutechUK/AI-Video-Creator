@@ -4,3 +4,6 @@
 !aws/automation/notebooklm.py
 !aws/automation/runner.py
 !aws/automation/rules.py
+!aws/automation/creator.py
+!aws/automation/creator_rules.py
+!aws/automation/creator_runner.py

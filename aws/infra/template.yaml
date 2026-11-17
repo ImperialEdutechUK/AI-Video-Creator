@@ -87,6 +87,11 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Run the 30-minute sheet automation and the daily summary.
+  CreatorEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Make chapter videos in NotebookLM for units in "Doc Formatting Completed Units".
   AllowProductionSheet:
     Type: String
     Default: "false"
@@ -589,6 +594,7 @@ Resources:
           AUTOMATION_ENABLED: !If [AutomationOn, "true", "false"]
           ALLOW_PRODUCTION_SHEET: !Ref AllowProductionSheet
           AUTOMATION_MAX_PER_RUN: !Ref AutomationMaxPerRun
+          CREATOR_ENABLED: !Ref CreatorEnabled
           AUTOMATION_TASK_FAMILY: !If [HasAutomationImage, !Sub "${ProjectName}-automation", ""]
           ALERT_TOPIC_ARN: !Ref AlertTopic
     DependsOn: WorkerTaskDefinition

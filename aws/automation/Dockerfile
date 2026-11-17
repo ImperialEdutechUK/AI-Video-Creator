@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
-COPY aws/automation/rules.py aws/automation/notebooklm.py aws/automation/runner.py ./
+COPY aws/automation/rules.py aws/automation/notebooklm.py aws/automation/runner.py aws/automation/creator.py aws/automation/creator_rules.py aws/automation/creator_runner.py ./
 
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "runner.py"]

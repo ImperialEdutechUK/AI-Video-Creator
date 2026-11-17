@@ -220,11 +220,16 @@ def _batch_get(pks: list[str]) -> dict[str, dict]:
     return out
 
 
+_last_scan: tuple | None = None
+
+
 def scan(dry_run: bool) -> dict:
     cfg = settings()
     client, wb = open_sheet()
     rows = rules.order_rows(client.read_rows(wb), cfg["start_row"])
-    keyed = [(r, rules.row_key(wb.key, r.url, r.unit, r.chapter, r.course)) for r in rows
+    global _last_scan
+    _last_scan = (client, wb, rows)  # reused by the chapter-video creator in the same tick
+    keyed =[(r, rules.row_key(wb.key, r.url, r.unit, r.chapter, r.course)) for r in rows
              if r.url and r.unit and r.chapter]
     items = _batch_get([k for _, k in keyed] + ["SKIP" + k for _, k in keyed])
     report = {"workbook": wb.name, "tab": wb.worksheet_name, "rows": len(rows),
@@ -370,6 +375,15 @@ def _start_download_task() -> bool:
                                    "assignPublicIp": "ENABLED"}}
     common = dict(cluster=CLUSTER, taskDefinition=AUTOMATION_TASK_FAMILY, count=1,
                   networkConfiguration=net, propagateTags="TASK_DEFINITION")
+    try:
+        import creator_sync
+        nb = creator_sync.notebook_url() if creator_sync.ENABLED else ""
+    except Exception:
+        log.exception("Could not read the creator notebook setting")
+        nb = ""
+    if nb:
+        common["overrides"] = {"containerOverrides": [
+            {"name": "automation", "environment": [{"name": "CREATOR_NOTEBOOK_URL", "value": nb}]}]}
     resp = ecs.run_task(capacityProviderStrategy=[{"capacityProvider": "FARGATE_SPOT", "weight": 1}], **common)
     if not resp.get("tasks") and ALLOW_ON_DEMAND_FALLBACK:
         log.warning("Spot capacity unavailable for the download task (%s) - using regular Fargate",
@@ -435,16 +449,30 @@ def tick(dry_run: bool = False) -> dict:
         return {"error": str(e)}
     clear_alert("microsoft_signin")
     clear_alert("sheet_problem")
+    creator_work = False
+    try:
+        import creator_sync
+        if creator_sync.ENABLED and _last_scan:
+            client, wb, log_rows = _last_scan
+            report["creator"] = creator_sync.scan(client, wb, log_rows, dry_run)
+            creator_work = creator_sync.needs_task()
+    except (LayoutError, GraphError) as e:
+        alert("creator_sheet", "SLC automation: chapter-video creator stopped - sheet problem",
+              f"The chapter-video creator did not touch the sheets:\n\n{e}")
+        report["creator"] = {"error": str(e)}
+    except Exception as e:  # never let the creator break the download automation
+        log.exception("Chapter-video creator scan failed")
+        report["creator"] = {"error": f"{e.__class__.__name__}: {e}"}
     if not dry_run:
         pending = [i for i in _active_auto_items() if i.get("qstate") == "pending"]
         report["pending_total"] = len(pending)
         keepalive = False
-        if not pending:
+        if not pending and not creator_work:
             age = _session_age()
             keepalive = age is not None and age > KEEPALIVE_SECONDS
             if keepalive:
                 report["keepalive"] = f"Google session last refreshed {age / 3600:.1f} h ago"
-        report["download_task_started"] = bool(pending or keepalive) and _start_download_task()
+        report["download_task_started"] = bool(pending or keepalive or creator_work) and _start_download_task()
     log.info("Automation %s: %s", "dry run" if dry_run else "tick", json.dumps(report, default=str)[:3000])
     return report
 
@@ -730,17 +758,32 @@ def verify_drive(drive, job: dict) -> str | None:
 
 def follow_up() -> dict:
     """Advance every in-flight row one step. Cheap when nothing is in flight."""
+    # Always (not only while download rows are in flight): a NotebookLM task
+    # doing chapter-video work must also be stopped if it runs too long.
+    if AUTOMATION_TASK_FAMILY:
+        try:
+            _stop_overdue_tasks(time.time())
+        except Exception:
+            log.exception("Could not check for overdue NotebookLM tasks")
+    out = _follow_up_downloads()
+    try:
+        import creator_sync
+        if creator_sync.ENABLED:
+            c = creator_sync.follow_up()
+            if c.get("logged"):
+                out["creator_logged"] = c["logged"]
+    except Exception:
+        log.exception("Chapter-video creator follow-up failed")
+    return out
+
+
+def _follow_up_downloads() -> dict:
     items = _active_auto_items()
     if not items:
         return {}
     from handler import _drive_module  # loaded lazily; same module object as the Lambda entry point
     now = time.time()
     counts: dict[str, int] = {}
-    if any(i.get("qstate") in ("pending", "downloading") for i in items):
-        try:
-            _stop_overdue_tasks(now)
-        except Exception:
-            log.exception("Could not check for overdue download tasks")
     paused = bool(google_signout())
     for brief in items:
         state = brief.get("qstate")

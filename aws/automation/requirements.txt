@@ -2,3 +2,4 @@
 # rebuild can't silently change browser behaviour.
 playwright==1.49.1
 boto3>=1.34
+pypdf==5.1.0

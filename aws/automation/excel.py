@@ -216,6 +216,36 @@ class GraphClient:
     def write_cell(self, wb: Workbook, col: str, row: int, value: str) -> None:
         self.request("PATCH", f"{self._ws(wb)}/range(address='{col}{row}')", {"values": [[value]]})
 
+    # ── generic helpers (other tabs, appending rows) ──
+    def open_tab(self, wb: Workbook, tab_name: str) -> Workbook:
+        """The same workbook, another tab (exact name, spaces ignored at the ends)."""
+        base = f"/drives/{wb.drive_id}/items/{wb.item_id}/workbook"
+        sheets = self.request("GET", f"{base}/worksheets?$select=id,name").get("value", [])
+        hits = [s for s in sheets if s["name"].strip().lower() == tab_name.strip().lower()]
+        if len(hits) != 1:
+            raise LayoutError(f"Tab {tab_name!r} not found (tabs: {', '.join(s['name'] for s in sheets)})")
+        return Workbook(wb.drive_id, wb.item_id, wb.name, hits[0]["id"], hits[0]["name"])
+
+    def read_grid(self, wb: Workbook) -> tuple[int, list[list[str]]]:
+        """(first row number, text of every used row from column A)."""
+        data = self.request("GET", f"{self._ws(wb)}/usedRange(valuesOnly=true)?$select=address,text")
+        first_row, first_col = parse_address(data.get("address", "A1"))
+        pad = [""] * (first_col - 1)
+        return first_row, [pad + [str(x) for x in r] for r in (data.get("text") or [])]
+
+    def read_range(self, wb: Workbook, address: str) -> list[list[str]]:
+        data = self.request("GET", f"{self._ws(wb)}/range(address='{address}')?$select=text")
+        return [[str(x) for x in r] for r in (data.get("text") or [])]
+
+    def write_range(self, wb: Workbook, address: str, values: list[list[str]]) -> None:
+        self.request("PATCH", f"{self._ws(wb)}/range(address='{address}')", {"values": values})
+
+    def last_used_row(self, wb: Workbook) -> int:
+        data = self.request("GET", f"{self._ws(wb)}/usedRange(valuesOnly=true)?$select=address")
+        last = data.get("address", "A1").split("!")[-1].split(":")[-1].replace("$", "")
+        m = re.fullmatch(r"[A-Za-z]+(\d+)", last)
+        return int(m.group(1)) if m else 1
+
 
 def _error_text(e: urllib.error.HTTPError) -> str:
     try:

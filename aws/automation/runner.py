@@ -35,6 +35,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from playwright.sync_api import sync_playwright
 
+import creator_runner
 import notebooklm
 import rules
 from notebooklm import NotebookError, SignInRequired
@@ -55,6 +56,9 @@ RUN_LIMIT_SECONDS = int(os.environ.get("RUN_LIMIT_SECONDS", "2400"))  # no new r
 ROW_LIMIT_SECONDS = int(os.environ.get("ROW_LIMIT_SECONDS", "1200"))  # one row may take at most 20 min
 OUTPUT_RETENTION_DAYS = int(os.environ.get("OUTPUT_RETENTION_DAYS", "3"))
 AUTOMATION_SID = "automation-bot-session"
+CREATOR_NOTEBOOK_URL = os.environ.get("CREATOR_NOTEBOOK_URL", "")   # set by the API when it starts the task
+CREATOR_TIME_SECONDS = int(os.environ.get("CREATOR_TIME_SECONDS", "900"))   # no new videos started after this
+CREATOR_GRACE_SECONDS = 600                                                  # ...and the step is stopped 10 min later
 OWNER = f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
 
 ddb = boto3.resource("dynamodb", region_name=REGION)
@@ -222,6 +226,18 @@ def save_session(state: dict) -> None:
                   ContentType="application/json", ServerSideEncryption="AES256")
 
 
+def send_alert(kind: str, subject: str, message: str) -> None:
+    """Email the team via the API (it throttles repeats)."""
+    if not API_FUNCTION:
+        log.warning("ALERT %s: %s", subject, message)
+        return
+    try:
+        lambda_client.invoke(FunctionName=API_FUNCTION, InvocationType="Event", Payload=json.dumps(
+            {"action": "automation_alert", "kind": kind, "subject": subject, "message": message}).encode())
+    except Exception:
+        log.exception("Could not send alert %s", kind)
+
+
 def set_signin_flag(required: bool, reason: str = "") -> None:
     if required:
         table.put_item(Item={"pk": "AUTOCFG#google", "kind": "autocfg", "signin_required": True,
@@ -374,6 +390,9 @@ def main() -> int:
             viewport={"width": 1600, "height": 1000},
         )
         context.set_default_timeout(30_000)
+        # The chapter-video creator copies share links via the clipboard.
+        for origin in ("https://notebook.google.com", "https://notebooklm.google.com"):
+            context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
         page = context.new_page()
         if not notebooklm.check_signed_in(page):
             set_signin_flag(True, "Google sent the saved session to the sign-in page.")
@@ -385,6 +404,28 @@ def main() -> int:
 
         done, signed_out = 0, False
         try:
+            if CREATOR_NOTEBOOK_URL:
+                # Chapter-video creator first: starting a video takes ~1 minute and
+                # NotebookLM then needs ~30 minutes, so start them as early as possible.
+                # Watchdog: a frozen browser must not hold the task. A half-started
+                # video is noticed and redone by the next run.
+                def _creator_frozen():
+                    log.error("Chapter-video creator step ran over %ss - stopping the task",
+                              CREATOR_TIME_SECONDS + CREATOR_GRACE_SECONDS)
+                    os._exit(1)
+                timer = threading.Timer(CREATOR_TIME_SECONDS + CREATOR_GRACE_SECONDS, _creator_frozen)
+                timer.daemon = True
+                timer.start()
+                try:
+                    rep = creator_runner.run(context, table, CREATOR_NOTEBOOK_URL,
+                                             deadline=time.time() + CREATOR_TIME_SECONDS, alert=send_alert)
+                    log.info("Creator: %s", rep)
+                except SignInRequired:
+                    raise
+                except Exception:
+                    log.exception("Chapter-video creator pass failed")
+                finally:
+                    timer.cancel()
             while time.time() - started < RUN_LIMIT_SECONDS:
                 if capacity_left() <= 0:
                     log.info("Video queue is busy - leaving remaining rows for the next run")
