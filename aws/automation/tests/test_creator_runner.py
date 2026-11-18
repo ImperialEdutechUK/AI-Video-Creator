@@ -37,7 +37,7 @@ class FakeNotebook:
 
     def patch(self, test):
         for name in ("open_notebook", "studio_items", "upload_source", "generate", "item_sources", "rename_item",
-                     "share_link", "pdf_matches"):
+                     "share_link", "pdf_matches", "add_text_source", "pdf_text"):
             p = mock.patch.object(creator, name, getattr(self, name))
             p.start()
             test.addCleanup(p.stop)
@@ -53,6 +53,13 @@ class FakeNotebook:
 
     def upload_source(self, page, pdf):
         self.uploaded.append(pdf.name)
+
+    def add_text_source(self, page, name, text):
+        self.uploaded.append(name)
+        self.texts = getattr(self, "texts", []) + [text]
+
+    def pdf_text(self, pdf):
+        return "chapter text from " + pdf.name
 
     def generate(self, page, source):
         if self.quota:
@@ -164,6 +171,51 @@ class Runner(unittest.TestCase):
         self.assertEqual(ch["artifact_id"], "a2")
         self.assertEqual(int(ch["attempts"]), 2)
         self.assertNotEqual(self.nb.items["a1"].title, f"U1C1 - {COURSE}")  # the wrong one is never renamed
+
+    def test_failed_pdf_video_is_made_again_from_pasted_text(self):
+        self.unit(chapters=1)
+        self.run_once()
+        del self.nb.items["a1"]                                    # NotebookLM: "generation failed"
+        self.run_once()
+        ch = self.get()["chapters"][0]
+        self.assertEqual(ch["mode"], "text")
+        self.assertEqual(ch["state"], "generating")               # restarted straight away, from text
+        self.assertEqual(int(ch["attempts"]), 1)
+        self.assertTrue(ch["source"].endswith(".txt") and "[" in ch["source"])
+        self.assertEqual(self.nb.uploaded[-1], ch["source"])
+        self.assertEqual(self.nb.sources[ch["artifact_id"]], ch["source"])  # only the text source was used
+        self.nb.finish(ch["artifact_id"])
+        self.run_once()
+        u = self.get()
+        self.assertEqual(u["chapters"][0]["state"], "ready")
+        self.assertEqual(u["cstate"], "logging")
+
+    def test_text_fallback_fails_after_its_own_attempts(self):
+        self.unit(chapters=1)
+        self.run_once()
+        for _ in range(3):                                         # PDF once, then text twice
+            aid = self.get()["chapters"][0]["artifact_id"]
+            del self.nb.items[aid]
+            self.run_once()
+        ch = self.get()["chapters"][0]
+        self.assertEqual(ch["state"], "failed")
+        self.assertIn("also failed from the PDF's text", ch["error"])
+        self.assertEqual(self.get()["cstate"], "logging")
+        self.assertEqual(sum(n.endswith(".txt") for n in self.nb.uploaded), 2)
+
+    def test_rename_hiccup_keeps_the_finished_video(self):
+        self.unit(chapters=1)
+        self.run_once()
+        self.nb.finish("a1")
+        with mock.patch.object(creator, "rename_item", side_effect=creator.CreatorError("did not stick")):
+            self.run_once()
+        ch = self.get()["chapters"][0]
+        self.assertEqual(ch["state"], "generating")               # kept, not made again
+        self.assertEqual(ch["artifact_id"], "a1")
+        self.assertEqual(int(ch["attempts"]), 1)
+        self.run_once()                                            # rename works next run
+        self.assertEqual(self.get()["chapters"][0]["state"], "ready")
+        self.assertEqual(len(self.nb.items), 1)
 
     def test_quota_pauses(self):
         self.unit(chapters=2)

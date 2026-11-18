@@ -29,6 +29,8 @@ from botocore.exceptions import ClientError
 
 import creator
 import creator_rules as cr
+from playwright.sync_api import Error as BrowserError
+
 from creator import CreatorError, NotebookUnavailable, QuotaReached
 
 log = logging.getLogger("creator")
@@ -105,6 +107,22 @@ def _fail(store: Store, unit: dict, i: int, message: str) -> None:
     store.save_chapter(unit, i, state=state, error=message[:300])
 
 
+TEXT_MODE = "text"
+
+
+def _generation_failed(store: Store, unit: dict, i: int, message: str) -> None:
+    """NotebookLM refused to make the video. Some PDFs fail every time while the
+    same content pasted in as text works, so a chapter made from its PDF gets a
+    fresh start from its text (Copied text source) before it counts as failed."""
+    ch = unit["chapters"][i]
+    if ch.get("mode") != TEXT_MODE:
+        log.warning("Unit %s chapter %s: %s - trying again from the PDF's text", unit.get("unit"), ch.get("n"), message)
+        store.save_chapter(unit, i, state="queued", mode=TEXT_MODE, attempts=0,
+                           error=(message + " Trying again with the PDF's text pasted in as the source.")[:300])
+    else:
+        _fail(store, unit, i, message + " (also failed from the PDF's text)")
+
+
 def _download_pdf(url: str, dest: Path) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -140,13 +158,15 @@ def run(context, table, notebook_url: str, deadline: float, alert=None) -> dict:
                 title = creator.video_title(int(unit["unit"]), int(ch["n"]), unit["course_name"])
                 source = ch.get("source", "")
                 if a is None:
-                    _fail(store, unit, i, "The video disappeared from NotebookLM Studio.")
+                    # A video NotebookLM gives up on turns into a "Video Overview
+                    # generation failed" entry without an id.
+                    _generation_failed(store, unit, i, "NotebookLM could not make the video (generation failed).")
                 elif a.generating:
                     if time.time() - float(ch.get("started_at", 0)) > GENERATING_LIMIT_SECONDS:
                         _fail(store, unit, i, f"NotebookLM was still making the video after "
                                               f"{GENERATING_LIMIT_SECONDS // 60} minutes.")
                 elif a.failed or not a.ready_video:
-                    _fail(store, unit, i, f"NotebookLM could not make the video ({a.title} {a.details}).")
+                    _generation_failed(store, unit, i, f"NotebookLM could not make the video ({a.title} {a.details}).")
                 else:
                     try:
                         used = creator.item_sources(page, a.id)
@@ -159,8 +179,13 @@ def run(context, table, notebook_url: str, deadline: float, alert=None) -> dict:
                         store.save_chapter(unit, i, state="ready", link=link, video_title=title,
                                            ready_at=_now(), error="")
                         report["collected"] += 1
-                    except CreatorError as e:
-                        _fail(store, unit, i, str(e))
+                    except (CreatorError, BrowserError) as e:
+                        # The video itself is made and checked: don't throw it away over a
+                        # rename/link hiccup - try those again next run (for a while).
+                        if time.time() - float(ch.get("started_at", 0)) > 2 * GENERATING_LIMIT_SECONDS:
+                            _fail(store, unit, i, str(e))
+                        else:
+                            log.warning("Unit %s chapter %s: %s - will retry next run", unit.get("unit"), ch.get("n"), e)
             store.finish_unit_if_done(unit)
 
         # 2. start new videos
@@ -187,16 +212,24 @@ def run(context, table, notebook_url: str, deadline: float, alert=None) -> dict:
                         log.warning("U%sC%s %s: %s", u, n, course, problem)
                         continue
                     digest = hashlib.sha1(raw.read_bytes()).hexdigest()
-                    source = creator.source_name(u, n, course, digest)
-                    pdf = work / source
-                    raw.rename(pdf)
+                    text_mode = ch.get("mode") == TEXT_MODE
+                    if text_mode:
+                        source = creator.text_source_name(u, n, course, digest)
+                        content = creator.pdf_text(raw)
+                    else:
+                        source = creator.source_name(u, n, course, digest)
+                        pdf = work / source
+                        raw.rename(pdf)
                     # Already made from this exact PDF (e.g. a retry after a crash)? Reuse it.
                     existing = [a for a in creator.studio_items(page) if a.title == title and a.ready_video]
                     if existing and creator.item_sources(page, existing[0].id) == [source]:
                         store.save_chapter(unit, i, state="generating", artifact_id=existing[0].id, source=source,
                                            started_at=_now(), attempts=int(ch.get("attempts", 0)) + 1)
                         continue
-                    creator.upload_source(page, pdf)
+                    if text_mode:
+                        creator.add_text_source(page, source, content)
+                    else:
+                        creator.upload_source(page, pdf)
                     store.save_chapter(unit, i, state="starting", source=source,
                                        attempts=int(ch.get("attempts", 0)) + 1)
                     artifact_id = creator.generate(page, source)
@@ -213,7 +246,7 @@ def run(context, table, notebook_url: str, deadline: float, alert=None) -> dict:
                               "The creator waits 3 hours and tries again. Nothing is lost.")
                     report["paused"] = True
                     return report
-                except (CreatorError, OSError) as e:
+                except (CreatorError, OSError, BrowserError) as e:  # one chapter's problem never stops the run
                     _fail(store, unit, i, str(e))
                 finally:
                     try:

@@ -93,6 +93,37 @@ def source_name(unit: int, chapter: int, course: str, pdf_hash: str = "") -> str
     return safe_name(video_title(unit, chapter, course)) + tag + ".pdf"
 
 
+def text_source_name(unit: int, chapter: int, course: str, pdf_hash: str = "") -> str:
+    """Name of the pasted-text copy of a chapter PDF (used when NotebookLM
+    can't make a video from the PDF itself). Ends in .txt so the video's
+    'View prompt and sources' list shows which source it was made from."""
+    tag = f" [{pdf_hash[:8]}]" if pdf_hash else ""
+    return safe_name(video_title(unit, chapter, course)) + tag + ".txt"
+
+
+def pdf_text(pdf: Path) -> str:
+    """The chapter's text, as a person would copy it out of the PDF: page
+    footers ('1 | Page ...') and table-of-contents dot leaders left out."""
+    from pypdf import PdfReader
+    try:
+        reader = PdfReader(str(pdf))
+        raw = [(p.extract_text() or "") for p in reader.pages]
+    except Exception as e:
+        raise CreatorError(f"The chapter PDF could not be read for its text ({e.__class__.__name__}).") from None
+    lines = []
+    for page_text in raw:
+        for line in page_text.splitlines():
+            s = " ".join(line.split())
+            # page footers ("1 | Page ..." or "... Ltd ... 2 | Page") and contents dot leaders
+            if not s or re.search(r"(?i)\b\d+\s*\|\s*page\b", s) or re.search(r"\.{8,}", s):
+                continue
+            lines.append(s)
+    text = "\n".join(lines)
+    if len(text.split()) < 100:
+        raise CreatorError("The chapter PDF has almost no text to copy (scanned pages?).")
+    return text
+
+
 def pdf_matches(pdf: Path, course: str, unit: int) -> str | None:
     """None if the PDF's first pages name this course and unit, else the problem.
     (Catches a chapter page in WordPress that links another course's PDF.)"""
@@ -177,6 +208,78 @@ def upload_source(page: Page, pdf: Path, timeout_s: int = 300) -> None:
             page.wait_for_timeout(2_000)
             return
     raise CreatorError(f"NotebookLM did not finish reading {pdf.name} within {timeout_s // 60} minutes.")
+
+
+def add_text_source(page: Page, name: str, text: str, timeout_s: int = 180) -> None:
+    """Add `text` as a 'Copied text' source and rename it `name` (NotebookLM
+    titles pasted text from its first line, so the bot renames it to its own,
+    unique name)."""
+    if name in source_names(page):
+        return
+    before = source_names(page)
+    page.get_by_role("button", name="Add source").click()
+    dialog = page.locator("mat-dialog-container").last
+    dialog.wait_for(timeout=20_000)
+    dialog.get_by_role("button", name=re.compile(r"Copied text")).click()
+    box = page.locator("mat-dialog-container textarea[formcontrolname=copiedText]").last
+    try:
+        box.wait_for(timeout=15_000)
+    except PWTimeout:
+        raise CreatorError("The 'Copied text' box did not open.") from None
+    box.fill(text)
+    page.locator("mat-dialog-container").last.get_by_role("button", name="Insert").click()
+    deadline = time.time() + timeout_s
+    index = -1
+    while time.time() < deadline:
+        page.wait_for_timeout(3_000)
+        _check_quota(page)
+        after = source_names(page)
+        if len(after) > len(before):
+            # the new source: first place where the list differs from before
+            index = next((i for i, (a, b) in enumerate(zip(after, before)) if a != b), len(before))
+            break
+    if index < 0:
+        raise CreatorError(f"NotebookLM did not add the pasted text within {timeout_s // 60} minutes.")
+    _wait_source_ready(page, index, deadline)
+    _rename_source(page, index, name)
+    # Adding pasted text switches the Studio panel to show that text ("Studio >
+    # Note"), hiding the Video Overview card: reload for the normal Studio view.
+    open_notebook(page, page.url.split("?")[0])
+
+
+def _source_rows(page: Page):
+    return page.locator(".single-source-container")
+
+
+def _wait_source_ready(page: Page, index: int, deadline: float) -> None:
+    box = _source_rows(page).nth(index).locator('input[type=checkbox][aria-label^="Select "]')
+    while time.time() < deadline:
+        if box.count() and box.is_enabled():
+            page.wait_for_timeout(2_000)
+            return
+        page.wait_for_timeout(3_000)
+    raise CreatorError("NotebookLM did not finish reading the pasted text.")
+
+
+def _rename_source(page: Page, index: int, name: str) -> None:
+    btn = _source_rows(page).nth(index).locator("button.source-item-more-button")
+    old = (btn.get_attribute("aria-description", timeout=10_000) or "") if btn.count() == 1 else ""
+    names = source_names(page)
+    if not old or index >= len(names) or names[index] != old:
+        raise CreatorError("Could not find the pasted-text source to rename it.")
+    btn.scroll_into_view_if_needed(timeout=10_000)
+    btn.click()
+    page.get_by_role("menuitem", name=re.compile(r"Rename", re.I)).click(timeout=10_000)
+    field = page.locator("mat-dialog-container input[formcontrolname=title]").last
+    try:
+        field.wait_for(timeout=10_000)
+    except PWTimeout:
+        raise CreatorError("The source Rename box did not appear.") from None
+    field.fill(name)
+    page.locator("mat-dialog-container").last.get_by_role("button", name="Save").click()
+    page.wait_for_timeout(2_500)
+    if name not in source_names(page):
+        raise CreatorError(f"Renaming the pasted text source to {name!r} did not stick.")
 
 
 # ── video overview ───────────────────────────────────────────────────────
@@ -344,7 +447,18 @@ def item_sources(page: Page, artifact_id: str) -> list[str]:
     return names
 
 
-def rename_item(page: Page, artifact_id: str, title: str) -> None:
+def rename_item(page: Page, artifact_id: str, title: str, tries: int = 3) -> None:
+    for attempt in range(tries):
+        try:
+            return _rename_item_once(page, artifact_id, title)
+        except (CreatorError, PWTimeout):
+            if attempt == tries - 1:
+                raise
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(3_000)
+
+
+def _rename_item_once(page: Page, artifact_id: str, title: str) -> None:
     _menu(page, artifact_id, "Rename")
     # The title turns into an input in place (no dialog).
     box = _item(page, artifact_id).locator("input.artifact-title-input")
