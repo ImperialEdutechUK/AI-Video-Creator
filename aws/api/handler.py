@@ -811,6 +811,9 @@ def handler(event, context):
         return automation.daily_summary()
     if action == "automation_alert":
         return automation.handle_alert_event(event)
+    if action == "extras_docx_to_pdf":
+        import extras_sync
+        return extras_sync.docx_to_pdf(event)
 
     req = _parse_request(event)
     path_matched = False

@@ -36,6 +36,7 @@ from botocore.exceptions import ClientError
 from playwright.sync_api import sync_playwright
 
 import creator_runner
+import extras_runner
 import notebooklm
 import rules
 from notebooklm import NotebookError, SignInRequired
@@ -59,6 +60,7 @@ AUTOMATION_SID = "automation-bot-session"
 CREATOR_NOTEBOOK_URL = os.environ.get("CREATOR_NOTEBOOK_URL", "")   # set by the API when it starts the task
 CREATOR_TIME_SECONDS = int(os.environ.get("CREATOR_TIME_SECONDS", "900"))   # no new videos started after this
 CREATOR_GRACE_SECONDS = 600                                                  # ...and the step is stopped 10 min later
+EXTRAS_TIME_SECONDS = int(os.environ.get("EXTRAS_TIME_SECONDS", "900"))      # podcasts / study guides step
 OWNER = f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
 
 ddb = boto3.resource("dynamodb", region_name=REGION)
@@ -236,6 +238,29 @@ def send_alert(kind: str, subject: str, message: str) -> None:
             {"action": "automation_alert", "kind": kind, "subject": subject, "message": message}).encode())
     except Exception:
         log.exception("Could not send alert %s", kind)
+
+
+def docx_to_pdf(docx: bytes, name: str) -> bytes:
+    """Word's PDF of a study guide, made by the API with the team's Microsoft
+    sign-in (Word for the web renders it with the document's real fonts)."""
+    if not API_FUNCTION:
+        raise RuntimeError("API_FUNCTION is not set - can't convert the study guide to PDF.")
+    stamp = f"{int(time.time() * 1000)}-{os.getpid()}"
+    src, dst = f"automation/extras/tmp/{stamp}.docx", f"automation/extras/tmp/{stamp}.pdf"
+    s3.put_object(Bucket=BUCKET, Key=src, Body=docx, ServerSideEncryption="AES256")
+    try:
+        resp = lambda_client.invoke(FunctionName=API_FUNCTION, InvocationType="RequestResponse", Payload=json.dumps(
+            {"action": "extras_docx_to_pdf", "docx_key": src, "pdf_key": dst, "name": name}).encode())
+        out = json.loads(resp["Payload"].read() or b"{}")
+        if resp.get("FunctionError") or not out.get("ok"):
+            raise RuntimeError(f"Word could not make the PDF: {str(out)[:300]}")
+        return s3.get_object(Bucket=BUCKET, Key=dst)["Body"].read()
+    finally:
+        for key in (src, dst):
+            try:
+                s3.delete_object(Bucket=BUCKET, Key=key)
+            except Exception:
+                pass
 
 
 def set_signin_flag(required: bool, reason: str = "") -> None:
@@ -424,6 +449,26 @@ def main() -> int:
                     raise
                 except Exception:
                     log.exception("Chapter-video creator pass failed")
+                finally:
+                    timer.cancel()
+            if CREATOR_NOTEBOOK_URL and extras_runner.has_work(table):
+                # Unit podcasts and study guides (same watchdog idea).
+                def _extras_frozen():
+                    log.error("Podcast / study guide step ran over %ss - stopping the task",
+                              EXTRAS_TIME_SECONDS + CREATOR_GRACE_SECONDS)
+                    os._exit(1)
+                timer = threading.Timer(EXTRAS_TIME_SECONDS + CREATOR_GRACE_SECONDS, _extras_frozen)
+                timer.daemon = True
+                timer.start()
+                try:
+                    rep = extras_runner.run(context, table, CREATOR_NOTEBOOK_URL,
+                                            deadline=time.time() + EXTRAS_TIME_SECONDS, s3=s3, bucket=BUCKET,
+                                            to_pdf=docx_to_pdf, alert=send_alert)
+                    log.info("Podcasts / study guides: %s", rep)
+                except SignInRequired:
+                    raise
+                except Exception:
+                    log.exception("Podcast / study guide pass failed")
                 finally:
                     timer.cancel()
             while time.time() - started < RUN_LIMIT_SECONDS:

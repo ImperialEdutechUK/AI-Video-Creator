@@ -20,6 +20,7 @@
 #   AUTOMATION_MAX_PER_RUN=<n>        new rows per run (default 5)
 #   AUTOMATION_INTERVAL_MINUTES=<n>   minutes between runs (default 10)
 #   CREATOR_ENABLED=true|false        make chapter videos from "Doc Formatting Completed Units"
+#   EXTRAS_ENABLED=true|false         make unit podcasts and study guides from the same tab
 #   ALERT_EMAIL=<address>             alerts + daily summary
 # (CloudFormation keeps a stack's previous parameter values unless they are
 #  passed, so the worker settings are always passed explicitly here.)
@@ -57,6 +58,8 @@ AUTOMATION_INTERVAL="${AUTOMATION_INTERVAL_MINUTES:-$(current_param AutomationIn
 AUTOMATION_INTERVAL="${AUTOMATION_INTERVAL:-10}"
 CREATOR_ENABLED="${CREATOR_ENABLED:-$(current_param CreatorEnabled)}"
 CREATOR_ENABLED="${CREATOR_ENABLED:-false}"
+EXTRAS_ENABLED="${EXTRAS_ENABLED:-$(current_param ExtrasEnabled)}"
+EXTRAS_ENABLED="${EXTRAS_ENABLED:-false}"
 ALERT_EMAIL="${ALERT_EMAIL-$(current_param AlertEmail)}"
 
 step "Deploying as: $(aws_ sts get-caller-identity --query Arn --output text)"
@@ -138,8 +141,9 @@ mkdir -p aws/api/build aws/.build
   --only-binary=:all: --upgrade --no-warn-conflicts
 cp aws/api/handler.py aws/api/build/handler.py
 cp backend/app/drive.py aws/api/build/drive.py   # unmodified Drive logic
-cp aws/api/automation.py aws/api/creator_sync.py aws/automation/rules.py aws/automation/excel.py \
-   aws/automation/creator_rules.py aws/automation/wordpress.py aws/api/build/
+cp aws/api/automation.py aws/api/creator_sync.py aws/api/extras_sync.py aws/automation/rules.py \
+   aws/automation/excel.py aws/automation/creator_rules.py aws/automation/extras_rules.py \
+   aws/automation/wordpress.py aws/api/build/
 # Keep only the Drive discovery document (saves ~90 MB and cold-start time).
 find aws/api/build/googleapiclient/discovery_cache/documents -type f ! -name 'drive.v3.json' -delete
 find aws/api/build -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -171,6 +175,7 @@ aws_ cloudformation deploy --stack-name "$PROJECT" \
     AutomationMaxPerRun="$AUTOMATION_MAX_PER_RUN" \
     AutomationIntervalMinutes="$AUTOMATION_INTERVAL" \
     CreatorEnabled="$CREATOR_ENABLED" \
+    ExtrasEnabled="$EXTRAS_ENABLED" \
     AlertEmail="$ALERT_EMAIL" \
   --tags Project="$PROJECT" --no-fail-on-empty-changeset
 
@@ -197,4 +202,4 @@ echo "Website : $SITE_URL"
 echo "API     : $API_URL"
 echo "Health  : ${API_URL%/}/healthz"
 echo "Worker image tag: $TAG"
-echo "Automation      : enabled=$AUTOMATION_ENABLED production_sheet=$ALLOW_PROD_SHEET every=${AUTOMATION_INTERVAL}min max_per_run=$AUTOMATION_MAX_PER_RUN image=${AUTO_TAG:-none} creator=$CREATOR_ENABLED"
+echo "Automation      : enabled=$AUTOMATION_ENABLED production_sheet=$ALLOW_PROD_SHEET every=${AUTOMATION_INTERVAL}min max_per_run=$AUTOMATION_MAX_PER_RUN image=${AUTO_TAG:-none} creator=$CREATOR_ENABLED extras=$EXTRAS_ENABLED"

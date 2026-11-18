@@ -7,3 +7,10 @@
 !aws/automation/creator.py
 !aws/automation/creator_rules.py
 !aws/automation/creator_runner.py
+!aws/automation/extras_rules.py
+!aws/automation/extras_runner.py
+!aws/automation/studyguide.py
+!aws/automation/garamond_widths.py
+!aws/automation/podcast_creator.py
+!aws/automation/fonts/
+!aws/automation/fonts/*.ttf

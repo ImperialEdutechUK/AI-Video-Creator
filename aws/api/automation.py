@@ -463,6 +463,19 @@ def tick(dry_run: bool = False) -> dict:
     except Exception as e:  # never let the creator break the download automation
         log.exception("Chapter-video creator scan failed")
         report["creator"] = {"error": f"{e.__class__.__name__}: {e}"}
+    try:
+        import extras_sync
+        if extras_sync.ENABLED and _last_scan:
+            client, wb, _rows = _last_scan
+            report["extras"] = extras_sync.scan(client, wb, dry_run)
+            creator_work = creator_work or extras_sync.needs_task()
+    except (LayoutError, GraphError) as e:
+        alert("extras_sheet", "SLC automation: podcasts / study guides stopped - sheet problem",
+              f"The podcast and study guide automation did not touch the sheet:\n\n{e}")
+        report["extras"] = {"error": str(e)}
+    except Exception as e:  # never let it break the other automations
+        log.exception("Podcast / study guide scan failed")
+        report["extras"] = {"error": f"{e.__class__.__name__}: {e}"}
     if not dry_run:
         pending = [i for i in _active_auto_items() if i.get("qstate") == "pending"]
         report["pending_total"] = len(pending)
@@ -774,6 +787,14 @@ def follow_up() -> dict:
                 out["creator_logged"] = c["logged"]
     except Exception:
         log.exception("Chapter-video creator follow-up failed")
+    try:
+        import extras_sync
+        if extras_sync.ENABLED:
+            x = extras_sync.follow_up()
+            if x.get("uploaded"):
+                out["extras_uploaded"] = x["uploaded"]
+    except Exception:
+        log.exception("Podcast / study guide follow-up failed")
     return out
 
 

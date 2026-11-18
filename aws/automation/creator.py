@@ -330,14 +330,20 @@ def start_video(page: Page, source: str, prompt: str = VIDEO_PROMPT, dry_run: bo
 
 
 def _select_only_source(page: Page, dialog, source: str) -> None:
+    _select_sources(page, dialog, [source])
+
+
+def _select_sources(page: Page, dialog, sources: list[str]) -> None:
     """The settings window's Sources picker: a list of options (one per source,
-    aria-selected) with a "Select all" box. Leave only `source` selected."""
+    aria-selected) with a "Select all" box. Leave exactly `sources` selected."""
+    wanted = set(sources)
+    source = ", ".join(sources)
     dialog.get_by_role("button", name=re.compile(r"\d+\s+sources?")).first.click()
     options = dialog.locator("mat-list-option[role=option]")
     try:
         options.first.wait_for(timeout=15_000)
     except PWTimeout:
-        raise CreatorError("The Video Overview source list did not open.") from None
+        raise CreatorError("The settings' source list did not open.") from None
 
     def state() -> list[tuple[str, bool]]:
         return options.evaluate_all("""els => els.map(e => [
@@ -346,22 +352,23 @@ def _select_only_source(page: Page, dialog, source: str) -> None:
 
     current = state()
     names = [n for n, _ in current]
-    if source not in names:
-        raise CreatorError(f"The source {source} is not in the Video Overview source list.")
-    if names.count(source) > 1:
-        raise CreatorError(f"The notebook has {names.count(source)} sources named {source}.")
+    for one in sources:
+        if one not in names:
+            raise CreatorError(f"The source {one} is not in the settings' source list.")
+        if names.count(one) > 1:
+            raise CreatorError(f"The notebook has {names.count(one)} sources named {one}.")
     # Untick "Select all" first when everything is ticked (one click instead of hundreds).
     if all(sel for _, sel in current) and len(current) > 1:
         dialog.locator("mat-checkbox.select-all-checkbox").click()
         page.wait_for_timeout(800)
         current = state()
     for i, (name, selected) in enumerate(current):
-        if selected != (name == source):
+        if selected != (name in wanted):
             options.nth(i).click()
             page.wait_for_timeout(150)
     final = state()
     picked = [n for n, sel in final if sel]
-    if picked != [source]:
+    if sorted(picked) != sorted(sources):
         raise CreatorError(f"Could not select only {source} (selected: {picked[:5]}).")
     dialog.get_by_role("button", name="Confirm").click()
     page.wait_for_timeout(1_500)
@@ -408,6 +415,11 @@ class Artifact:
     @property
     def failed(self) -> bool:
         return bool(re.search(r"(?i)\b(failed|couldn.t|could not|error)\b", self.title + " " + self.details))
+
+    @property
+    def ready_audio(self) -> bool:
+        return (self.kind == "Audio Overview" and not self.generating and not self.failed
+                and bool(re.search(r"\b\d{1,2}:\d{2}\b", self.details)))
 
     @property
     def ready_video(self) -> bool:
@@ -507,3 +519,96 @@ def generate(page: Page, source: str, prompt: str = VIDEO_PROMPT) -> str:
         page.wait_for_timeout(2_000)
     _check_quota(page)
     raise CreatorError("No new Video Overview appeared in Studio after 'Generate now'.")
+
+
+# ── Audio Overview (unit podcasts) ───────────────────────────────────────
+
+AUDIO_FORMAT = "Deep dive"
+AUDIO_LENGTH = "Default"
+AUDIO_FOCUS_BOX = "What should the AI hosts focus on in this episode?"
+AUDIO_FORMATS = ("Deep dive", "Brief", "Critique", "Debate")
+
+
+def audio_format(a: "Artifact") -> str | None:
+    """The format a Studio audio item shows in its details ("12:40 · Deep dive · 2 sources")."""
+    for f in AUDIO_FORMATS:
+        if re.search(rf"(?:^|·)\s*{re.escape(f)}\s*(?:·|$)", a.details or "", re.I):
+            return f
+    return None
+
+
+def _set_audio_format(page: Page, dialog) -> None:
+    """Format AUDIO_FORMAT and Length AUDIO_LENGTH, then check both stuck."""
+    radio = dialog.locator("mat-radio-button").filter(has_text=AUDIO_FORMAT)
+    radio.get_by_text(AUDIO_FORMAT, exact=True).click()
+    page.wait_for_timeout(800)
+    if "mat-mdc-radio-checked" not in (radio.first.get_attribute("class") or ""):
+        raise CreatorError(f"The Audio Overview format did not switch to '{AUDIO_FORMAT}'.")
+    toggle = dialog.locator("mat-button-toggle").filter(
+        has=page.get_by_text(AUDIO_LENGTH, exact=True))
+    if toggle.count() != 1:
+        raise CreatorError(f"The Audio Overview has no '{AUDIO_LENGTH}' length option.")
+    chosen = lambda: "mat-button-toggle-checked" in (toggle.get_attribute("class") or "")
+    if not chosen():
+        toggle.locator("button").click()
+        page.wait_for_timeout(500)
+    if not chosen():
+        raise CreatorError(f"The Audio Overview length did not switch to '{AUDIO_LENGTH}'.")
+
+
+def start_audio(page: Page, sources: list[str], prompt: str, dry_run: bool = False, screenshot: str = "") -> None:
+    """Studio > Audio Overview > customise: format Deep dive, length Default,
+    exactly `sources` (all the unit's chapter PDFs), the team's prompt, Generate now."""
+    card = page.locator("[role=button][aria-label='Audio Overview']")
+    card.hover()
+    card.locator(".option-icon").evaluate("e => e.click()")
+    page.locator("mat-dialog-container").filter(has_text="Customise Audio Overview").wait_for(timeout=20_000)
+    dialog = page.locator("mat-dialog-container").last
+    _set_audio_format(page, dialog)
+    _select_sources(page, dialog, sources)
+    box = dialog.get_by_role("textbox", name=AUDIO_FOCUS_BOX)
+    box.fill(prompt)
+    text = dialog.inner_text()
+    n = len(sources)
+    if not re.search(rf"\b{n} sources?\b", text):
+        raise CreatorError(f"The Audio Overview is not set to the unit's {n} source(s).")
+    if box.input_value().strip() != prompt.strip():
+        raise CreatorError("The podcast prompt did not go into the focus box.")
+    if screenshot:
+        page.screenshot(path=screenshot)
+    if dry_run:
+        dialog.get_by_role("button", name=re.compile("close", re.I)).first.click()
+        return
+    dialog.get_by_role("button", name="Generate now").click()
+    try:
+        dialog.wait_for(state="detached", timeout=30_000)
+    except PWTimeout:
+        _check_quota(page)
+        raise CreatorError("The Audio Overview settings window did not close after 'Generate now'.") from None
+    page.wait_for_timeout(3_000)
+    _check_quota(page)
+
+
+def generate_audio(page: Page, sources: list[str], prompt: str) -> str:
+    """Start a Deep dive audio overview of `sources`; returns the new Studio item's id."""
+    before = {a.id for a in studio_items(page)}
+    start_audio(page, sources, prompt)
+    for _ in range(30):
+        new = [a for a in studio_items(page) if a.id not in before]
+        if new:
+            return new[0].id
+        page.wait_for_timeout(2_000)
+    _check_quota(page)
+    raise CreatorError("No new Audio Overview appeared in Studio after 'Generate now'.")
+
+
+def download_item(page: Page, artifact_id: str, dest_dir: Path, timeout_s: int = 300) -> Path:
+    """The item's ⋮ > Download, saved in dest_dir."""
+    with page.expect_download(timeout=timeout_s * 1000) as d:
+        _menu(page, artifact_id, "Download")
+    name = d.value.suggested_filename or f"{artifact_id}.m4a"
+    out = Path(dest_dir) / safe_name(name, 120)
+    d.value.save_as(str(out))
+    if out.stat().st_size < 50_000:
+        raise CreatorError(f"The downloaded audio is too small ({out.stat().st_size} bytes).")
+    return out

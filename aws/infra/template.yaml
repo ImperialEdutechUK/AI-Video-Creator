@@ -92,6 +92,11 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Make chapter videos in NotebookLM for units in "Doc Formatting Completed Units".
+  ExtrasEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Make unit podcasts (NotebookLM + Podcast Creator) and study guides (StudyGen) for units in "Doc Formatting Completed Units".
   AllowProductionSheet:
     Type: String
     Default: "false"
@@ -595,6 +600,7 @@ Resources:
           ALLOW_PRODUCTION_SHEET: !Ref AllowProductionSheet
           AUTOMATION_MAX_PER_RUN: !Ref AutomationMaxPerRun
           CREATOR_ENABLED: !Ref CreatorEnabled
+          EXTRAS_ENABLED: !Ref ExtrasEnabled
           AUTOMATION_TASK_FAMILY: !If [HasAutomationImage, !Sub "${ProjectName}-automation", ""]
           ALERT_TOPIC_ARN: !Ref AlertTopic
     DependsOn: WorkerTaskDefinition
@@ -705,6 +711,9 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:PutObject]
                 Resource: !Sub "${MediaBucket.Arn}/automation/*"
+              - Effect: Allow
+                Action: s3:DeleteObject   # its own temporary study guide files
+                Resource: !Sub "${MediaBucket.Arn}/automation/extras/tmp/*"
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub "${MediaBucket.Arn}/uploads/auto/*"

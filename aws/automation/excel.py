@@ -165,6 +165,47 @@ class GraphClient:
                 raise GraphError(0, str(e.reason)) from None
         raise GraphError(0, "unreachable")
 
+    # ── Word -> PDF (Word for the web renders it, with the document's real fonts) ──
+    def docx_to_pdf(self, docx: bytes, name: str, folder: str = "SLC automation temp") -> bytes:
+        """Upload `docx` to a temporary file in the signed-in account's OneDrive,
+        download it converted to PDF, then delete the temporary file."""
+        safe = re.sub(r"[^A-Za-z0-9._ -]+", "-", name).strip() or "document"
+        path = urllib.parse.quote(f"{folder}/{int(time.time())}-{safe}.docx")
+        item = self._raw("PUT", f"{GRAPH}/me/drive/root:/{path}:/content", docx,
+                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        item_id = json.loads(item)["id"]
+        try:
+            pdf = b""
+            for attempt in range(4):  # conversion can be briefly unavailable right after the upload
+                try:
+                    pdf = self._raw("GET", f"{GRAPH}/me/drive/items/{item_id}/content?format=pdf")
+                    break
+                except GraphError as e:
+                    if attempt == 3 or e.code not in (404, 406, 409, 423, 429, 500, 502, 503, 504):
+                        raise
+                    time.sleep(3 * (attempt + 1))
+            if not pdf.startswith(b"%PDF"):
+                raise GraphError(0, "Word did not return a PDF")
+            return pdf
+        finally:
+            try:
+                self._raw("DELETE", f"{GRAPH}/me/drive/items/{item_id}")
+            except GraphError:
+                pass
+
+    def _raw(self, method: str, url: str, data: bytes | None = None, content_type: str = "") -> bytes:
+        headers = {"Authorization": f"Bearer {self._access_token()}"}
+        if content_type:
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            raise GraphError(e.code, _error_text(e)) from None
+        except urllib.error.URLError as e:
+            raise GraphError(0, str(e.reason)) from None
+
     # ── workbook ──
     def open_workbook(self, share_url: str, tab_hint: str = "chapterwise") -> Workbook:
         item = self.request("GET", f"/shares/{share_id(share_url)}/driveItem?$select=id,name,parentReference")

@@ -30,6 +30,7 @@ class Split(unittest.TestCase):
             "TQUK Level 3 Diploma for Residential Childcare": ("TQUK", "Level 3 Diploma for Residential Childcare"),
             "Level 5 Extended Diploma in IT-Networking (RQF)": ("", "Level 5 Extended Diploma in IT-Networking (RQF)"),
             "NCFE CACHE Level 2 Certificate in  Understanding Working": ("NCFE CACHE", "Level 2 Certificate in Understanding Working"),
+            "NCFC CACHE Level 2 Adult social care certificate": ("NCFE CACHE", "Level 2 Adult social care certificate"),
         }
         for raw, want in cases.items():
             self.assertEqual(cr.split_course_name(raw), want, raw)

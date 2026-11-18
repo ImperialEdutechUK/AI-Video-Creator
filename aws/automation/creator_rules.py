@@ -25,7 +25,7 @@ DOC_HEADERS = {"A": "course name", "B": "course link", "C": "unit", "I": "chapte
 # Awarding bodies as written in the log's column B (left: how they appear in
 # course names, lower case, longest first so "ncfe cache" wins over "ncfe").
 AWARDING_BODIES = [
-    ("ncfe cache", "NCFE CACHE"), ("ncfecache", "NCFE CACHE"),
+    ("ncfe cache", "NCFE CACHE"), ("ncfecache", "NCFE CACHE"), ("ncfc cache", "NCFE CACHE"),
     ("focus awards", "Focus Awards"), ("focus award", "Focus Awards"),
     ("pearson btec", "Pearson BTEC"),
     ("qualifi", "Qualifi"), ("qualify", "Qualifi"),
