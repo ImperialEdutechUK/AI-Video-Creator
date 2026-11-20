@@ -125,7 +125,9 @@ class UnitDecision:
     reason: str = ""
 
 
-def decide_unit(row: DocRow, logged: set[tuple[str, int]], item: dict | None, now: float) -> UnitDecision:
+def sheet_skip(row: DocRow, logged: set[tuple[str, int]]) -> UnitDecision | None:
+    """The skip the sheet alone decides, whatever the bot's record says (None = the
+    record matters). Lets the scan read records only for the rows that need them."""
     if not row.course_raw or row.course_raw.lower() in ("test", "testing", "course name"):
         return UnitDecision("skip", "no course name")
     who = row.videos_by.lower()
@@ -137,6 +139,14 @@ def decide_unit(row: DocRow, logged: set[tuple[str, int]], item: dict | None, no
         return UnitDecision("skip", "no course link")
     if (course_key(row.course_raw), row.unit) in logged:
         return UnitDecision("skip", "already in the video log")
+    return None
+
+
+def decide_unit(row: DocRow, logged: set[tuple[str, int]], item: dict | None, now: float) -> UnitDecision:
+    skip = sheet_skip(row, logged)
+    if skip:
+        return skip
+    who = row.videos_by.lower()
     if item:
         state = item.get("cstate")
         if state == "skipped" and float(item.get("retry_at", 0)) <= now and who != BOT_NAME:

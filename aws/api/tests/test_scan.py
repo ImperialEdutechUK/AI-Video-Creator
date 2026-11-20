@@ -51,8 +51,15 @@ class Scan(unittest.TestCase):
         import boto3
         boto3.resource("dynamodb", region_name="eu-west-2").create_table(
             TableName="scan-test-jobs", BillingMode="PAY_PER_REQUEST",
-            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}])
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                                  {"AttributeName": "active", "AttributeType": "S"},
+                                  {"AttributeName": "created_at", "AttributeType": "N"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[{  # same as the real table (template.yaml)
+                "IndexName": "active",
+                "KeySchema": [{"AttributeName": "active", "KeyType": "HASH"},
+                              {"AttributeName": "created_at", "KeyType": "RANGE"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["qstate", "sid"]}}])
         sys.modules.pop("automation", None)
         import automation
         from excel import Workbook
@@ -135,6 +142,29 @@ class Scan(unittest.TestCase):
         self.assertTrue(report["download_task_started"])
         self.assertIn("keepalive", report)
         self.assertEqual(started, [1])
+
+    def test_reads_records_only_for_rows_that_need_them(self):
+        # Rows the sheet settles (person, Yes, no URL, not NotebookLM) cost no reads;
+        # a failed bot row (I = NO) still needs its record to decide on a retry.
+        self.run_scan([r(20, 3, 1)])                                   # bot claims row 20
+        pk20 = next(iter(self.a.table.scan()["Items"]))["pk"]
+        self.a.table.update_item(Key={"pk": pk20}, UpdateExpression="SET qstate = :f, attempts = :one REMOVE active",
+                                 ExpressionAttributeValues={":f": "failed", ":one": 1})
+        rows = [r(10, 2, 4),                                           # new -> needs its record
+                r(11, 2, 5, h="Menuka", i="Yes"),                       # done by a person
+                r(12, 2, 6, h="auto", i="Yes"),                         # already added
+                r(13, 2, 7, url=""),                                    # no URL
+                r(14, 2, 8, url="https://example.com/x"),               # not NotebookLM
+                r(20, 3, 1, h="auto", i="NO")]                          # failed -> retry needs the record
+        asked = []
+        real = self.a._batch_get
+        self.a._batch_get = lambda pks: asked.extend(pks) or real(pks)
+        self.addCleanup(setattr, self.a, "_batch_get", real)
+        report, _ = self.run_scan(rows)
+        key = lambda row: self.a.rules.row_key(self.wb.key, row.url, row.unit, row.chapter, row.course)
+        self.assertEqual(sorted(asked), sorted([key(rows[0]), pk20]))  # no SKIP keys: colour check is off
+        self.assertEqual([c["row"] for c in report["claimed"]], [10])
+        self.assertEqual([c["row"] for c in report["retrying"]], [20])
 
     def test_start_row_order_and_limit(self):
         rows = [r(n, 1, n % 9 + 1, url=f"{LINK}-{n}") for n in (6340, 6345, 6646, 6647, 6650, 6700)]

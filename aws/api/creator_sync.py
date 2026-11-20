@@ -149,7 +149,9 @@ def scan(client, log_wb: Workbook, log_rows: list, dry_run: bool) -> dict:
         return report
     rows = cr.order_units(all_rows)
     logged = cr.logged_units(log_rows)
-    items = A._batch_get([cr.unit_key(r.link, r.unit) for r in rows if r.unit and r.link])
+    # Records only for rows the sheet doesn't already settle (see cr.sheet_skip).
+    items = A._batch_get([cr.unit_key(r.link, r.unit) for r in rows
+                          if r.unit and r.link and cr.sheet_skip(r, logged) is None])
     wp = None
     for row in rows:
         pk = cr.unit_key(row.link, row.unit) if (row.unit and row.link) else ""

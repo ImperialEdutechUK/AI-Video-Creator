@@ -231,7 +231,16 @@ def scan(dry_run: bool) -> dict:
     _last_scan = (client, wb, rows)  # reused by the chapter-video creator in the same tick
     keyed =[(r, rules.row_key(wb.key, r.url, r.unit, r.chapter, r.course)) for r in rows
              if r.url and r.unit and r.chapter]
-    items = _batch_get([k for _, k in keyed] + ["SKIP" + k for _, k in keyed])
+    # Read DynamoDB records only for rows whose outcome depends on them. Rows the
+    # sheet alone settles (done by a person, already added, no URL, ...) are
+    # skipped by rules.decide() whatever their record says - that is nearly all
+    # of the ~7000-row log, and reading a record for each of them on every run
+    # was most of the project's AWS bill.
+    need = {k for r, k in keyed if rules.decide(r, None).action != "skip"}
+    items = _batch_get(list(need) + (["SKIP" + k for k in need] if cfg["skip_colors"] else []))
+    # The one record a sheet-settled row still uses: a "pending" row a person has
+    # taken over. Pending rows are always in the small 'active' index.
+    waiting = {i["pk"]: i for i in _active_auto_items() if i.get("qstate") == "pending"}
     report = {"workbook": wb.name, "tab": wb.worksheet_name, "rows": len(rows),
               "claimed": [], "retrying": [], "skipped_colour": [], "in_progress": 0, "other_skips": {}}
     budget = MAX_PER_RUN
@@ -247,7 +256,7 @@ def scan(dry_run: bool) -> dict:
                 report["other_skips"][bucket] = report["other_skips"].get(bucket, 0) + 1
                 continue
             first_row_of[pk] = row.row
-        item = items.get(pk) if pk else None
+        item = (items.get(pk) if pk in need else waiting.get(pk)) if pk else None
         decision = rules.decide(row, item)
         if decision.action == "skip":
             reason = decision.reason
